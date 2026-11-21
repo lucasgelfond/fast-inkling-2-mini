@@ -10,6 +10,9 @@ dependencies = [
     "huggingface_hub",
     # mlx-vlm fork that ships the inkling2_loop model
     "mlx-vlm @ git+https://github.com/internet-projects/inkling2-mlx@v0.1.0",
+    # the Inkling 2 image processor (loaded even for text) needs torchvision
+    "torch",
+    "torchvision",
 ]
 
 [project.scripts]
