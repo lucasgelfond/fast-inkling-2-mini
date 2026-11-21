@@ -366,8 +366,30 @@ class FastDecoder:
         )
 
 
+def keep_single_row_restores_plain():
+    """Keep a lone APC restore in single-request caches.
+
+    APC merges restored rows into batch caches, even when there is only one
+    row. A one-row batch cache has left_padding [0], which eligible() rejects,
+    so every turn after a prefix-cache hit decoded on the slow path (about 18
+    vs 26 tok/s). The rows are owned copies, and _merge_and_release_cache_rows
+    already uses a lone row as-is when no merge applies.
+    """
+    from mlx_vlm import apc
+
+    merge = apc._merge_exact_cache_entries
+
+    def merge_exact(entries, prefix_lens):
+        if len(entries) == 1:
+            return entries[0]
+        return merge(entries, prefix_lens)
+
+    apc._merge_exact_cache_entries = merge_exact
+
+
 def install(model):
     """Route eligible short forwards (decode and speculative verify) to the compiled path."""
+    keep_single_row_restores_plain()
     lm = getattr(model, "language_model", model)
     fast.apply(model)
     decoder = FastDecoder(lm)
