@@ -1,0 +1,2 @@
+[console_scripts]
+inkling-fast = inkling_fast.cli:main

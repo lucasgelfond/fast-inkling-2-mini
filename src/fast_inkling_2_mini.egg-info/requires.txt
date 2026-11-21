@@ -1,0 +1,5 @@
+mlx>=0.32.4
+huggingface_hub
+mlx-vlm @ git+https://github.com/internet-projects/inkling2-mlx@v0.1.0
+torch
+torchvision
