@@ -18,11 +18,10 @@ import mlx.nn as nn
 from mlx_vlm.models.inkling2 import language as L
 from mlx_vlm.models.switch_layers import _gather_sort, _scatter_unsort
 
+from .kernels import route_epilogue
+from .moe_v4 import moe_v4
+
 _ATTN_ORDER = ("k_proj", "v_proj", "q_proj", "r_proj", "gate_proj")
-USE_ROUTE_KERNEL = os.environ.get("INKLING_ROUTE", "0") == "1"  # slower: serial top-k on one thread
-USE_TOPK_KERNEL = os.environ.get("INKLING_TOPK", "1") == "1"
-USE_MOE_V4 = os.environ.get("INKLING_MOE_V4", "1") == "1"
-USE_MOE_KERNEL = False  # custom kernel is exact but slower than gather_qmm in-chain (see kernels.py)
 
 
 def _concat_quantized(layers, axis):
@@ -49,18 +48,6 @@ def _concat_quantized(layers, axis):
     # (every expert matrix copied) on every call.
     mx.eval(list(parts.values()))
     return parts, first.bits, first.group_size, first.mode
-
-
-ATTN_BITS = int(os.environ.get("INKLING_ATTN_BITS", "0"))  # 0 = keep checkpoint bits (lossless)
-
-
-def _requantize(parts, bits, gs, mode, new_bits):
-    """Lossy: dequantize packed rows and requantize at fewer bits (affine, group 64)."""
-    w = mx.dequantize(parts["weight"], parts["scales"], parts.get("biases"), group_size=gs, bits=bits, mode=mode)
-    q = mx.quantize(w.astype(mx.bfloat16), group_size=64, bits=new_bits)
-    out = {"weight": q[0], "scales": q[1], "biases": q[2]}
-    mx.eval(list(out.values()))
-    return out, new_bits, 64, "affine"
 
 
 class _Packed:
@@ -92,15 +79,6 @@ def fuse_attention(attn):
     if got is None:
         return False
     parts, bits, gs, mode = got
-    if ATTN_BITS and bits > ATTN_BITS:
-        parts, bits, gs, mode = _requantize(parts, bits, gs, mode, ATTN_BITS)
-        o = attn.o_proj
-        if isinstance(o, nn.QuantizedLinear) and o.bits > ATTN_BITS:
-            op = {"weight": o.weight, "scales": o.scales, "biases": o.get("biases")}
-            op, ob, ogs, om = _requantize(op, o.bits, o.group_size, o.mode, ATTN_BITS)
-            o.weight, o.scales, o.bits, o.group_size, o.mode = op["weight"], op["scales"], ob, ogs, om
-            if "biases" in op:
-                o.biases = op["biases"]
     sizes = [layer.weight.shape[0] for layer in layers]
     offsets = [0]
     for n in sizes:
@@ -215,16 +193,10 @@ def _moe_call(self, x):
     fused = self.__dict__.get("_fast_gate_up")
     if fused is None or self.training:
         return _orig_moe_call(self, x)
-    w, s, b, bits, gs, mode, width = fused[:7]
-    interleaved = len(fused) > 7 and fused[7]
-    if USE_TOPK_KERNEL and x.shape[0] == 1 and x.shape[1] == 1:
-        from .kernels import route_epilogue
+    w, s, b, bits, gs, mode, width = fused
+    if x.shape[0] == 1 and x.shape[1] == 1:
         raw = (x.astype(mx.float32) @ self.gate_weight.astype(mx.float32).T).reshape(-1)
         idx, rw = route_epilogue(raw, self.e_score_correction_bias, self.top_k, self.route_scale)
-        indices, weights = idx.reshape(1, 1, -1), rw.reshape(1, 1, -1)
-    elif USE_ROUTE_KERNEL and x.shape[0] == 1 and x.shape[1] == 1:
-        from .kernels import route_one
-        idx, rw = route_one(x.reshape(-1), self.gate_weight, self.e_score_correction_bias, self.top_k, self.route_scale)
         indices, weights = idx.reshape(1, 1, -1), rw.reshape(1, 1, -1)
     else:
         indices, weights = L._route(
@@ -233,27 +205,16 @@ def _moe_call(self, x):
     glu = self.switch_mlp
     dp = glu.down_proj
     if (
-        USE_MOE_V4 and x.shape[0] == 1 and x.shape[1] == 1 and bits == 3 and mode == "affine"
+        x.shape[0] == 1 and x.shape[1] == 1 and bits == 3 and mode == "affine"
         and gs == 64 and s.dtype == mx.bfloat16 and dp.bits == 3 and dp.mode == "affine"
         and dp.scales.dtype == mx.bfloat16 and x.dtype == mx.bfloat16
     ):
-        from .moe_v4 import moe_v4
         act = glu.activation
         y = moe_v4(
             x.reshape(-1), (w, s, b), (dp.weight, dp.scales, dp.biases),
             indices.reshape(-1).astype(mx.uint32), act.gate_cap, act.up_cap,
         )
         out = (y.astype(mx.float32) * weights.reshape(-1, 1)).sum(axis=0).astype(x.dtype)
-        return out.reshape(x.shape)
-    if USE_MOE_KERNEL and x.shape[0] == 1 and x.shape[1] == 1 and mode == "affine" and glu.down_proj.mode == "affine":
-        from .kernels import moe_decode
-        act = glu.activation
-        out = moe_decode(
-            x.reshape(-1), (w, s, b, bits),
-            (glu.down_proj.weight, glu.down_proj.scales, glu.down_proj.biases, glu.down_proj.bits),
-            indices.reshape(-1).astype(mx.uint32), weights.reshape(-1).astype(mx.float32),
-            act.gate_cap, act.up_cap,
-        )
         return out.reshape(x.shape)
     xe = mx.expand_dims(x, (-2, -3))
     do_sort = indices.size >= 64
@@ -264,15 +225,7 @@ def _moe_call(self, x):
         xe, w, s, b, rhs_indices=idx, transpose=True,
         group_size=gs, bits=bits, mode=mode, sorted_indices=do_sort,
     )
-    post = self.__dict__.get("_oq_post_scales")  # NVFP4 per-expert global scales (oQ)
-    if post is not None:
-        s13 = post[0][idx]
-        gu = gu * s13.reshape(*s13.shape, 1, 1).astype(gu.dtype)
-        weights = weights * post[1][indices]
-    if interleaved:  # rows [gate0, up0, gate1, up1, ...]
-        up, gate = gu[..., 1::2], gu[..., 0::2]
-    else:
-        up, gate = gu[..., :width], gu[..., width:]
+    up, gate = gu[..., :width], gu[..., width:]
     out = glu.down_proj(glu.activation(up, gate), idx, sorted_indices=do_sort)
     if do_sort:
         out = _scatter_unsort(out, inv, indices.shape)
@@ -303,23 +256,17 @@ def _scales_to_bf16(lm):
                     setattr(obj, name, nv)
                 n += 1
 
-    which = os.environ.get("INKLING_BF16_WHICH", "gu,down,o").split(",")
     for layer in lm.model.layers:
         moe = layer.mlp
         fused = moe.__dict__.get("_fast_gate_up")
-        if "gu" in which and fused is not None and fused[1].dtype == mx.float32:
+        if fused is not None and fused[1].dtype == mx.float32:
             w, s, b = fused[:3]
             s2, b2 = s.astype(mx.bfloat16), None if b is None else b.astype(mx.bfloat16)
             mx.eval(s2, b2)  # materialize: a lazy astype captured by mx.compile re-runs every call
             object.__setattr__(moe, "_fast_gate_up", (w, s2, b2, *fused[3:]))
             n += 1
-        if "down" in which:
-            conv(moe.switch_mlp.down_proj)
-        if "o" in which:
-            conv(layer.self_attn.o_proj)
-        packed = layer.self_attn.__dict__.get("_fast_packed")
-        if "packed" in which and packed is not None:
-            conv(packed)
+        conv(moe.switch_mlp.down_proj)
+        conv(layer.self_attn.o_proj)
     # lm_head runs on float32 inputs (exact logits) and the embedding table sets
     # the activation dtype, so both keep their stored scales.
     mx.eval(lm.parameters())

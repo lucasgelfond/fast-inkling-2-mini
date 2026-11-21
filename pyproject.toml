@@ -1,18 +1,19 @@
 [project]
 name = "fast-inkling-2-mini"
 version = "0.1.0"
-description = "Fast local inference for Thinking Machines' Inkling 2 Mini on Apple silicon (MLX + Metal kernels + ANE prefill)"
+description = "Fast local inference for Thinking Machines' Inkling 2 Mini on Apple silicon (MLX + Metal kernels)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = [
     "mlx>=0.32.4",
+    "huggingface_hub",
     # mlx-vlm fork that ships the inkling2_loop model
     "mlx-vlm @ git+https://github.com/internet-projects/inkling2-mlx@v0.1.0",
 ]
 
-[project.optional-dependencies]
-ane = ["coremltools==9.0", "torch==2.7.0", "numpy"]
+[project.scripts]
+inkling-fast = "inkling_fast.cli:main"
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -23,6 +24,3 @@ where = ["src"]
 
 [tool.ruff]
 line-length = 130
-
-[tool.ruff.lint.per-file-ignores]
-"scripts/*" = ["E402", "E701", "E702", "E731", "E741", "B007", "B023", "B905", "F821", "F841", "SIM108"]

@@ -17,7 +17,7 @@ hidden-state captures (DSpark taps), so drafters run on this path too.
 """
 
 import math
-import os  # noqa: E402
+import os
 
 import mlx.core as mx
 from mlx_vlm.models.base import LanguageModelOutput
@@ -25,14 +25,12 @@ from mlx_vlm.models.inkling2 import language as L
 from mlx_vlm.models.inkling2.language import (
     BatchRotatingKVCache,
     RotatingKVCache,
-    _attention_residual,
     banded_additive_mask,
 )
 
 from . import fast
 from .fast import fuse_attention, fuse_moe
-from .kernels import attention_mix as _kernel_mix
-from .kernels import message_gates, ring_mask, sliding_postproj, stack_gates
+from .kernels import attention_mix, message_gates, ring_mask, sliding_postproj, stack_gates
 
 MAX_TOKENS = int(os.environ.get("INKLING_MAX_TOKENS", "16"))
 # Prefill chunk lengths that take the compiled path (each length is traced once).
@@ -41,10 +39,6 @@ MAX_TOKENS = int(os.environ.get("INKLING_MAX_TOKENS", "16"))
 # prompt log-probs).
 PREFILL_LAST_ONLY = os.environ.get("INKLING_PREFILL_LAST_ONLY", "1") == "1"
 PREFILL_SIZES = {int(v) for v in os.environ.get("INKLING_PREFILL_SIZES", "256,512,1024,2048").split(",") if v}
-USE_MIX = os.environ.get("INKLING_MIX", "1") == "1"
-USE_POSTPROJ = os.environ.get("INKLING_POSTPROJ", "1") == "1"
-USE_RING = os.environ.get("INKLING_RING", "1") == "1"
-BF16_HEAD = os.environ.get("INKLING_BF16_HEAD", "1") == "1"
 
 
 def _static_sconv(state, x, weight, divisor):
@@ -139,7 +133,7 @@ class _Pass:
             parts = [norm(gated[i]).astype(dtype) for i, norm in enumerate(norms)]
         q_in, k_in, v_in = parts
         o = packed.splits
-        if USE_POSTPROJ and attn.is_sliding and n == 1 and b == 1 and dtype == mx.bfloat16:
+        if attn.is_sliding and n == 1 and b == 1 and dtype == mx.bfloat16:
             if shared_input:
                 raw = packed.matmul(q_in).reshape(-1)
             else:
@@ -242,7 +236,7 @@ class _Pass:
         mask = None
         if isinstance(kv, RotatingKVCache):
             wrapped = kv._idx != k.shape[2] and kv._idx < kv.offset
-            if USE_RING and n == 1 and wrapped and kv.keep == 0 and not getattr(conv, "is_speculating", False):
+            if n == 1 and wrapped and kv.keep == 0 and not getattr(conv, "is_speculating", False):
                 # Attend in storage order; the mask maps each slot to its age.
                 mask = ring_mask(r, attn.rel_proj.astype(x.dtype), k, kv._idx, attn.sliding, attn.rel_extent)
             else:
@@ -339,7 +333,7 @@ class FastDecoder:
 
     def logits(self, normalized):
         hd = self.lm.lm_head
-        if not BF16_HEAD or not hasattr(hd, "bits") or hd.scales.dtype != mx.bfloat16:
+        if not hasattr(hd, "bits") or hd.scales.dtype != mx.bfloat16:
             return self.lm._logits_from_norm(normalized)
         # bf16 activations against the 4-bit head (weights unchanged); softcap in f32.
         z = mx.quantized_matmul(
@@ -388,13 +382,3 @@ def install(model):
     mx.eval(lm.parameters())
     mx.clear_cache()
     return decoder
-
-
-def attention_mix(states, query, normalize_values=True, norm_weights=None, eps=1e-6, out_dtype=mx.float32):
-    if USE_MIX:
-        return _kernel_mix(states, query, normalize_values, norm_weights, eps, out_dtype)
-    out = _attention_residual(mx.stack(states, axis=-2), query, normalize_values)
-    if norm_weights is not None:
-        out = mx.fast.rms_norm(out, None, eps) * norm_weights.astype(mx.float32)
-        out = out.astype(out_dtype)
-    return out
