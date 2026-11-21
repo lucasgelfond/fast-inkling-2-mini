@@ -11,8 +11,6 @@ Fast local inference for [Inkling 2 Mini](https://thinkingmachines.ai/news/inkli
 | llama.cpp b12600 | Unsloth UD-Q3_K_XL | 12.8 | 37.6 |
 | TensorFold ([#4337](https://github.com/ashhart/TensorFold/pull/4337)) | original (NVFP4 experts) | 11.6\* | ~41\* |
 
-Base M4, 32 GB, batch 1, greedy. \*TensorFold's own server benchmarks: 256-token decode, and prefill from a cold 2,048-token prompt.
-
 
 The loop model comes from [internet-projects/inkling2-mlx](https://github.com/internet-projects/inkling2-mlx), a dependency that is not vendored here.
 
