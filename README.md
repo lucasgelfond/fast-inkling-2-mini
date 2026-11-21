@@ -1,11 +1,17 @@
 # fast-inkling-2-mini
 
-Fast local inference for [Inkling 2 Mini](https://thinkingmachines.ai/news/inkling-2-mini/). I tried this on my 32GB M4 base MacBook Pro. This got me speedups both over llama.cpp and over mlx-serve.
+Fast local inference for [Inkling 2 Mini](https://thinkingmachines.ai/news/inkling-2-mini/). I tried this on my 32GB M4 base MacBook Pro. This got me speedups over llama.cpp, standard MLX and the other engines I tried.
 
-| | llama.cpp | Standard MLX | **fast-inkling** |
+| Engine | Weights | Decode (tok/s, 128 tokens) | Prefill (tok/s, 512 tokens) |
 |---|---|---|---|
-| Decode (128 tokens) | 12.8 tok/s | 18.6–19.6 | **26.8–28.8** |
-| Prefill (512 tokens) | 37.6 | 178–184 | **222–230** |
+| **fast-inkling** | 3-bit | **26.8–28.8** | **222–236** |
+| oMLX 0.8.1 | oQ3e-mtp | 22.4 | – |
+| Standard MLX (mlx-vlm) | 3-bit | 18.6–19.6 | 178–184 |
+| mlx-lm ([#2086](https://github.com/ml-explore/mlx-lm/pull/2086)) | original (NVFP4 experts) | 14.8 | 198 |
+| llama.cpp b12600 | Unsloth UD-Q3_K_XL | 12.8 | 37.6 |
+| TensorFold ([#4337](https://github.com/ashhart/TensorFold/pull/4337)) | original (NVFP4 experts) | 11.6\* | ~41\* |
+
+Base M4, 32 GB, batch 1, greedy. \*TensorFold's own server benchmarks: 256-token decode, and prefill from a cold 2,048-token prompt.
 
 
 The loop model comes from [internet-projects/inkling2-mlx](https://github.com/internet-projects/inkling2-mlx), a dependency that is not vendored here.
