@@ -1,0 +1,22 @@
+[
+  {
+    "prompt_tokens": 48,
+    "generation_tokens": 160,
+    "prompt_tps": 59.94,
+    "generation_tps": 10.54,
+    "peak_memory_gb": 15.27,
+    "wall_s": 15.99,
+    "mode": "dspark",
+    "mean_accept": 1.42
+  },
+  {
+    "prompt_tokens": 31,
+    "generation_tokens": 160,
+    "prompt_tps": 56.49,
+    "generation_tps": 9.3,
+    "peak_memory_gb": 15.27,
+    "wall_s": 17.78,
+    "mode": "dspark",
+    "mean_accept": 1.01
+  }
+]

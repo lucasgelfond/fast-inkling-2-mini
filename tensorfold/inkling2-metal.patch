@@ -1,0 +1,2442 @@
+diff --git a/docs/inkling2-mini-metal-plan.md b/docs/inkling2-mini-metal-plan.md
+new file mode 100644
+index 0000000..b52d0fc
+--- /dev/null
++++ b/docs/inkling2-mini-metal-plan.md
+@@ -0,0 +1,135 @@
++# Inkling 2 Mini on Metal: the concrete plan for slices H1, M1 to M5
++
++This plan finishes the Metal half of the draft plan in pull request #4274 (`docs/design/inkling-2-mini.md` on that branch).
++It is local work for review. It claims no slice, and it was not posted to the issue, the pull request or ATC.
++The maintainer's seven decisions in #4274 stand. One deviation is stated under "Checkpoint" below.
++
++## Contract
++
++- **Behavior.** `tensorfold` loads `Inkling2LoopForConditionalGeneration` (`inkling2_loop`) on Metal and runs text decode.
++  Before this work the family refused `inkling2_loop`, and no backend served any Inkling 2 checkpoint.
++- **Target.** TensorFold `main` at `99d2384`, family `inkling2`, backend Metal, one rank, a base M4 (10-core GPU, no tensor units), 32 GB.
++- **Owning modules.** `zig/src/families/inkling2/` (config, loop plan, Metal model, state, forward, backend),
++  `zig/kernels/metal/inkling2/` (the family's kernels), `zig/src/native/` (registration), `zig/tests/inkling2/` (dev tool).
++- **Shared blocks reused.** `core/row_projection.zig` (affine 3-8 bit row matmuls with MLX's arithmetic) for every BF16-table
++  projection, `core/checkpoint_metal.zig` and `core/quant/mlx_affine.zig` for the views, `lanes` for serving.
++- **Correctness check.** The 48-token fixture in the local reference set: per layer-visit hidden cosine of at least 0.999,
++  and the 16 greedy tokens equal. Then the engine's own exactness (prompt chunk equals decode rows, drafted equals plain).
++- **Performance metric.** Decode and prompt tok/s on the same Mac against mlx-vlm (23.9 / 165), oMLX (22.4) and llama.cpp
++  (12.0 / 36), the speed bar being decode no slower than a standard server (#4274, decision 6).
++- **Hardware.** One base M4. An M5 (tensor-unit prompt path) and any CUDA chip are not available here.
++
++## Checkpoint
++
++Decision 4 says Metal starts from the original checkpoint (BF16 dense weights, NVFP4 and MXFP8 experts).
++This Mac has about 21 GB free, and that checkpoint is about 20 GB, so it is not downloaded.
++This work uses a local MLX affine conversion instead (`mlx-3bit`): attention 6-bit, experts 3-bit (layers 1-19; layers 0 and
++20-23 at 4-bit), embedding and head 4-bit, all group 64. Layers 0-19 store FP32 expert scales and biases; layers 20-23 store BF16 ones.
++MLX promotes the expert matmuls to FP32 when the tables are FP32 (FP32 activations and outputs); the kernels follow both.
++The reference hidden states come from this same checkpoint, so the comparison is like for like.
++Serving the original NVFP4/MXFP8 checkpoint is slice M3 below and stays open.
++
++## The model, as the engine runs it
++
++From `config.json` (`text_config`) and the MLX loop module that produced the reference:
++
++- 24 stored layers, hidden 2,304. Layers 6 to 17 run three passes: 48 layer visits a token.
++- The visit plan: layers 0-5, then 6-17 three times, then 18-23. Visit `v` of layer `i` in pass `p` uses cache slot `i` for
++  pass 0 and `24 + (p - 1) * 12 + (i - 6)` after. Each slot holds its own KV and four conv states.
++- Attention residuals replace residual adds: a block boundary every 6 layers. A layer's attention input is a learned-query
++  softmax over the finished blocks plus the running state (one query, or three for q/k/v on a global layer).
++  The MLP input is the same with one query. Keys are RMS-normalized states; the values are the normalized states too.
++- Pass 2 and 3 restart from the pre-loop state. Their messages read the previous pass's block at layer 12 and its final
++  output, with four learned queries a loop layer (q, k, v, MLP).
++- Message gates: `(1 - tanh(Wf g)) * h + tanh(Wg g) * m`, `g = Wd [rms(h); rms(m)]`, rank 64, FP32 except `Wd`'s BF16 input.
++- Attention: 24 query heads, 8 KV heads of 128. Layers 5, 11, 17, 23 global; the rest slide over 1,024 tokens.
++  q is L2-clipped at 22.63 after a per-head scale; k is L2-clipped; v is RMS-normalized without a gain.
++  A rank-16 relative bias `r . rel_proj[:, dist]` for distances under 1,024 (L2-clipped at 8 after a scale).
++  A query-dependent sink logit with a zero value. Global layers multiply q and r by `1 + 0.1 ln(max(pos / 8192, 1))`.
++  The output is gated by `sigmoid(gate_proj(x))`.
++- Short convolutions, 4 taps, `(conv + x) / sqrt(5)`: on k and v (sliding layers), after attention and after the MLP.
++  Global layers' k and v use an input-dependent conv: static taps plus a per-head `weight_proj(x)`, `/ 3`.
++- 128 experts, top 8 by `sigmoid(score) + bias`, weights normalized and scaled by 8, softcapped SwiGLU
++  (`tanh(g/4)*4*sigmoid(g) * tanh(u/25)*25`). No shared expert.
++- Final: an attention residual over the four blocks and the last output, RMS norm, head, softcap 30, 200,058 real tokens.
++
++## Slices
++
++| Slice | What, on this plan | Status here |
++|---|---|---|
++| H1 | `config.zig` accepts `inkling2_loop` with `loop_config` (refuses `is_varloop`), taps up to 48 visits; `loop.zig` builds the visit plan. | done |
++| H2 | Names for the gates and the message queries in the MLX layout (`*_message_gate.*`, `message_input.query`). | MLX names done; official names open |
++| M1 | Attention: sliding and global, sink, relative bias, log scaling, L2 clips; decode rows and prompt rows (pre-M5 only). | done, no contract |
++| M2 | Glue: embedding + norm, attention residual mixes, short convs (static and dynamic), router, softcapped SwiGLU, combine, head. | done, no contract |
++| M3 | Routed experts. Here: MLX affine 3/4-bit with FP32 or bf16 tables (a family kernel). The NVFP4/MXFP8 path stays open. | MLX done |
++| M4 | The loop kernels: message attention and the four rank-64 gates. | done, no contract |
++| M5 | The engine: 48 visit slots, the lane backend, the Metal registration, text only, images refused. | forward done; lanes open |
++| M6-M8 | DSpark, images, the served receipt and recipe. | not started |
++
++Kernel contract: each new kernel needs a Metal contract registration (`zig/tests/contract/metal_main.zig`) and launch records.
++That is not done in this local work; it is listed under remaining work.
++
++## Milestones and notes
++
++Kept in order as the work proceeds.
++
++1. **Toolchain.** Zig 0.17.0 (ziglang.org tarball), Xcode Metal toolchain. `zig build native -Dcpu=apple_m1` builds in 3 min 40 s;
++   `zig build test-inkling2-host` passes 24, skips 4; `zig build test-lfm2` (LFM2 family GPU checks on this Mac) passes.
++2. **Host slice H1.** `config.zig` parses `inkling2_loop` (loop_config, `is_varloop` refused, MLX affine quantization_config,
++   taps by visit); `loop.zig` builds the 48-visit plan. `zig build test-inkling2-host`: 28 pass, 4 skip (4 new tests).
++3. **Weights load.** `families/inkling2/metal/` loads every tensor of the `mlx-3bit` checkpoint with checked dtypes and
++   shapes in 7.3 s. Finding: layers 0-19 store FP32 expert tables, layers 20-23 store BF16 tables; MLX's arithmetic
++   differs (FP32 vs BF16 expert outputs), and the kernels take both.
++4. **One layer matches.** The first full forward ran but drifted from layer 0. An op-by-op comparison against the MLX
++   layer (lazy load, layer 0 only) found the bug: a sliding layer outside the loop read k and v from unwritten input rows.
++   After the fix every layer-0 op matches at cos >= 0.99998 (q, k, v, r, gate, sink, both convs, clips, KV, attention,
++   o_proj, the attention conv, the MLP mix, the norm, all 384 picks, the experts and the output).
++5. **Full forward and greedy match.** On the 48-token fixture: last-position logits cos 0.999936 (max abs diff 0.71 after
++   the softcap), the same top token, and the 16 greedy tokens equal (16 of 16). Mean per-row hidden cosine is at least
++   0.995 at every one of the 48 visits and 0.9989 after the final norm. The worst single row drops to 0.977 (layer 13).
++   That is not an arithmetic error: at layer 1, rows 1, 6 and 16 pick a different 8th expert than MLX, with 8th/9th
++   router-key margins of 1.7e-4 to 8.9e-4, while every input to the router matches at cos >= 0.99997. So the 0.999
++   per-row bar is met only where routing agrees; matching it everywhere would need MLX's exact BF16 rounding order.
++6. **Speed (dev tool, not a served receipt).** `tf-inkling2-run`, base M4, `mlx-3bit`, greedy, one stream, plain decode
++   (no drafter), timed with the GPU lock held; other agents' benchmarks shared the machine between runs.
++
++   | Engine | Decode tok/s | Prompt tok/s |
++   |---|---|---|
++   | TensorFold native (this work) | 25.0 (63 tokens after the 48-token fixture; 23.7-24.2 in earlier runs) | 48.0 (one cold 512-token chunk) |
++   | mlx-vlm, best local path | 23.9 | 165 |
++   | oMLX | 22.4 | - |
++   | llama.cpp | 12.0 | 36 |
++
++   The harnesses differ: these are TensorFold's dev-tool timings, not `tools/bench_openai.py` against a served engine.
++   Profile of the 512-token prompt: without the MoE it runs at 199 tok/s, so about 80% of prompt time is the routed experts.
++   Tried and lost: grouping the picks by expert on the GPU (a sort, then each weight chunk read once for up to 8 slots,
++   same bits as the per-slot kernel): 39-40 tok/s against 45-48 for the per-slot kernel. It was removed.
++
++## Remaining work
++
++- **M5, the served engine.** A `lanes.backend.Backend` for the family (one-row rounds first), `native/inkling2.zig` and
++  the `inkling2_loop` entry in `native/metal.zig`, prompt-cache snapshots of the 48 slots, admission by memory class,
++  image and audio refusals with tests. Then a served receipt with `tools/bench_openai.py` and cold 2k-64k prompts.
++- **Prompt path.** The experts need a tiled prompt kernel (simdgroup matrices, FP32 tables) to approach MLX's 165 tok/s;
++  the core `simd_qmm_bits` tiles read bf16 tables only. The attention prompt path is a per-row loop, fine at 512 rows.
++- **KV memory.** Every slot keeps every position. The 40 sliding visits need only 1,024 positions (a ring).
++- **Kernel contract.** None of the 15 family kernels is registered in `zig/tests/contract/metal_main.zig` or in the
++  launch records yet; that gate is required before a pull request.
++- **Exactness gates.** Prompt chunk versus decode rows, resumed versus fresh, concurrent versus solo: not run yet.
++  The decode and prompt expert kernels share one arithmetic, so a row's bits do not depend on the chunk.
++- **Checkpoint per decision 4.** The original NVFP4/MXFP8 checkpoint (slice M3) and DSpark (M6) are not started; the
++  20 GB download does not fit this Mac's free disk.
++- **Process.** No ATC claim or radar session was made (local work, no publication); a pull request would need both.
++
++## Files
++
++- Host: `zig/src/families/inkling2/config.zig` (loop config, MLX affine format), `loop.zig`, `config_test.zig`,
++  `host_test.zig`, `fixtures/mini_mlx_config.json`.
++- Metal family: `zig/src/families/inkling2/metal/` (`metal.zig`, `geometry.zig`, `weights.zig`, `kernels.zig`,
++  `model.zig`, `state.zig`, `encode.zig`, `layer.zig`, `forward.zig`).
++- Kernels: `zig/kernels/metal/inkling2/inkling2.metal`, `inkling2_attn.metal`, `inkling2_experts.metal`;
++  registered in `zig/kernels/metal/sources.zig`.
++- Engine root and tool: `zig/src/tensorfold.zig` (`inkling2_metal`), `zig/build/metal_targets.zig` (`tf-inkling2-run`),
++  `zig/tests/inkling2/run.zig`.
++- Checks: `zig build test-inkling2-host` 29 pass, 4 skip; `python3 tools/zig/lean_check.py` 168 problems, equal to the
++  clean baseline (0 new); `zig fmt --check` and `git diff --check` clean.
+diff --git a/zig/build/metal_targets.zig b/zig/build/metal_targets.zig
+index cf1e99e..ab8cb9d 100644
+--- a/zig/build/metal_targets.zig
++++ b/zig/build/metal_targets.zig
+@@ -242,6 +242,7 @@ pub fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
+         .{ .name = "tf-lfm2-bench", .path = "zig/tests/lfm2_bench.zig", .about = "LFM2-MoE prompt-chunk and one-row decode timing" },
+         .{ .name = "tf-lfm2-exact", .path = "zig/tests/lfm2_exact.zig", .about = "LFM2-MoE prompt chunks, windows and committed-state exactness" },
+         .{ .name = "tf-lfm2-fp64", .path = "zig/tests/lfm2_fp64.zig", .about = "LFM2 projection classes and attention on the tensor units, the tiles and the twin, each against float64" },
++        .{ .name = "tf-inkling2-run", .path = "zig/tests/inkling2/run.zig", .about = "Inkling 2 Mini on Metal: each visit's rows, last logits and greedy tokens against a reference, then timing" },
+         .{ .name = "tensorfold", .path = "zig/src/main.zig", .about = "The native engine's command line" },
+         .{ .name = "tf-nemotron-fixtures", .path = "zig/tests/nemotron_fixtures.zig", .about = "Nemotron kernels against the Python engine's captured ops" },
+         .{ .name = "tf-nemotron-bench", .path = "zig/tests/nemotron_bench.zig", .about = "One-row projection kernels timed by tile count" },
+diff --git a/zig/kernels/metal/inkling2/inkling2.metal b/zig/kernels/metal/inkling2/inkling2.metal
+new file mode 100644
+index 0000000..691eba8
+--- /dev/null
++++ b/zig/kernels/metal/inkling2/inkling2.metal
+@@ -0,0 +1,346 @@
++// Inkling 2 Mini's glue: embedding, norms, residual mixes, message gates, short convs, router (FP32 where MLX is).
++#include <metal_stdlib>
++using namespace metal;
++
++// The pinned geometry (the loader refuses any other checkpoint).
++constant constexpr uint D = 2304;
++constant constexpr uint QH = 24;
++constant constexpr uint KVH = 8;
++constant constexpr uint HD = 128;
++constant constexpr uint DREL = 16;
++constant constexpr uint EXT = 1024;
++constant constexpr uint E = 128;
++constant constexpr uint TOPK = 8;
++constant constexpr uint RANK = 64;
++// A row kernel's threads and each thread's values (strided by TG).
++constant constexpr uint TG = 256;
++constant constexpr uint PER = D / TG;
++constant constexpr uint SGS = TG / 32;
++
++// The sum of `v` over the threadgroup; every thread gets it. `buf` holds SGS floats.
++inline float ink_tg_sum(float v, threadgroup float* buf, uint sg, uint lane) {
++  v = simd_sum(v);
++  if (lane == 0) buf[sg] = v;
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  float s = lane < SGS ? buf[lane] : 0.0f;
++  s = simd_sum(s);
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  return s;
++}
++
++inline float ink_inv_rms(const thread float* v, float eps, threadgroup float* buf, uint sg, uint lane) {
++  float sq = 0.0f;
++  for (uint j = 0; j < PER; ++j) sq += v[j] * v[j];
++  return metal::precise::rsqrt(ink_tg_sum(sq, buf, sg, lane) / float(D) + eps);
++}
++
++// Embedding row ids[row] (4-bit affine, bf16 tables, MLX's dequantize), then embed_norm (MLX's bf16 RMS order).
++[[kernel]] void ink_embed_norm(const device uint* ids [[buffer(0)]], const device uint8_t* table [[buffer(1)]],
++                               const device bfloat* scales [[buffer(2)]], const device bfloat* biases [[buffer(3)]],
++                               const device bfloat* w [[buffer(4)]], constant float& eps [[buffer(5)]],
++                               device bfloat* out [[buffer(6)]], uint row [[threadgroup_position_in_grid]],
++                               uint t [[thread_position_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
++                               uint lane [[thread_index_in_simdgroup]]) {
++  const ulong id = ids[row];
++  float v[PER];
++  for (uint j = 0; j < PER; ++j) {
++    const uint e = t + TG * j;
++    const uint q = (table[id * (D / 2) + e / 2] >> (4 * (e & 1))) & 15u;
++    const float s = scales[id * (D / 64) + e / 64], b = biases[id * (D / 64) + e / 64];
++    v[j] = float(bfloat(s * float(q) + b));
++  }
++  threadgroup float buf[SGS];
++  const float inv = ink_inv_rms(v, eps, buf, sg, lane);
++  for (uint j = 0; j < PER; ++j) out[size_t(row) * D + t + TG * j] = w[t + TG * j] * bfloat(v[j] * inv);
++}
++
++// out = bf16(w * (x * inv)) for FP32 rows (MLX's FP32 RMS, then the cast), or w * bf16(x * inv) for bf16 rows.
++template <typename TI>
++[[kernel]] void ink_rms(const device TI* x [[buffer(0)]], const device bfloat* w [[buffer(1)]], constant uint& stride [[buffer(2)]],
++                        constant float& eps [[buffer(3)]], device bfloat* out [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
++                        uint t [[thread_position_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
++                        uint lane [[thread_index_in_simdgroup]]) {
++  float v[PER];
++  for (uint j = 0; j < PER; ++j) v[j] = float(x[size_t(row) * stride + t + TG * j]);
++  threadgroup float buf[SGS];
++  const float inv = ink_inv_rms(v, eps, buf, sg, lane);
++  for (uint j = 0; j < PER; ++j) {
++    const uint e = t + TG * j;
++    if (is_same<TI, float>::value) out[size_t(row) * D + e] = bfloat(float(w[e]) * (v[j] * inv));
++    else out[size_t(row) * D + e] = w[e] * bfloat(v[j] * inv);
++  }
++}
++template [[host_name("ink_rms_f32")]] [[kernel]] decltype(ink_rms<float>) ink_rms<float>;
++template [[host_name("ink_rms_bf16")]] [[kernel]] decltype(ink_rms<bfloat>) ink_rms<bfloat>;
++
++// out[row][q] = softmax over states (blocks, then the partial) of rms(state) . query[q] / 48, applied to rms(state).
++struct MixArgs {
++  uint nb;      // finished blocks
++  uint nq;      // learned queries (1, 3 or 4)
++  uint stride;  // elements between one block's rows and the next block's (rows * D)
++  uint pstride; // the partial's row stride
++};
++template <typename TP>
++[[kernel]] void ink_mix(const device bfloat* blocks [[buffer(0)]], const device TP* partial [[buffer(1)]],
++                        const device float* query [[buffer(2)]], constant MixArgs& a [[buffer(3)]], device float* out [[buffer(4)]],
++                        uint row [[threadgroup_position_in_grid]], uint t [[thread_position_in_threadgroup]],
++                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
++  threadgroup float buf[SGS];
++  const uint ns = a.nb + 1;
++  float keys[5][PER];
++  for (uint s = 0; s < ns; ++s) {
++    for (uint j = 0; j < PER; ++j) {
++      const uint e = t + TG * j;
++      keys[s][j] = s < a.nb ? float(blocks[size_t(s) * a.stride + size_t(row) * D + e]) : float(partial[size_t(row) * a.pstride + e]);
++    }
++    const float inv = ink_inv_rms(keys[s], 1e-6f, buf, sg, lane);
++    for (uint j = 0; j < PER; ++j) keys[s][j] = keys[s][j] * inv;
++  }
++  for (uint q = 0; q < a.nq; ++q) {
++    float score[5];
++    float top = -INFINITY;
++    for (uint s = 0; s < ns; ++s) {
++      float d = 0.0f;
++      for (uint j = 0; j < PER; ++j) d += keys[s][j] * query[q * D + t + TG * j];
++      score[s] = ink_tg_sum(d, buf, sg, lane) * (1.0f / 48.0f);
++      top = max(top, score[s]);
++    }
++    float total = 0.0f;
++    for (uint s = 0; s < ns; ++s) {
++      score[s] = metal::precise::exp(score[s] - top);
++      total += score[s];
++    }
++    for (uint j = 0; j < PER; ++j) {
++      float o = 0.0f;
++      for (uint s = 0; s < ns; ++s) o += (score[s] / total) * keys[s][j];
++      out[(size_t(row) * a.nq + q) * D + t + TG * j] = o;
++    }
++  }
++}
++template [[host_name("ink_mix_bf16")]] [[kernel]] decltype(ink_mix<bfloat>) ink_mix<bfloat>;
++template [[host_name("ink_mix_f32")]] [[kernel]] decltype(ink_mix<float>) ink_mix<float>;
++
++// A message gate's input: [rms(h); rms(m)] (FP32, no gain), cast to bf16 for down_proj.
++[[kernel]] void ink_gate_in(const device float* h [[buffer(0)]], const device float* m [[buffer(1)]], constant uint2& strides [[buffer(2)]],
++                            constant float& eps [[buffer(3)]], device bfloat* out [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
++                            uint t [[thread_position_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
++                            uint lane [[thread_index_in_simdgroup]]) {
++  threadgroup float buf[SGS];
++  float v[PER];
++  for (uint half_ = 0; half_ < 2; ++half_) {
++    const device float* src = half_ == 0 ? h + size_t(row) * strides.x : m + size_t(row) * strides.y;
++    for (uint j = 0; j < PER; ++j) v[j] = src[t + TG * j];
++    const float inv = ink_inv_rms(v, eps, buf, sg, lane);
++    for (uint j = 0; j < PER; ++j) out[size_t(row) * 2 * D + half_ * D + t + TG * j] = bfloat(v[j] * inv);
++  }
++}
++
++// out = (1 - tanh(g . Wf[n])) * h + tanh(g . Wg[n]) * m, all FP32 (g from down_proj's bf16 row).
++[[kernel]] void ink_gate_out(const device bfloat* g [[buffer(0)]], const device bfloat* wf [[buffer(1)]], const device bfloat* wg [[buffer(2)]],
++                             const device float* h [[buffer(3)]], const device float* m [[buffer(4)]], constant uint2& strides [[buffer(5)]],
++                             device float* out [[buffer(6)]], uint2 at [[thread_position_in_grid]], uint2 tt [[thread_position_in_threadgroup]]) {
++  threadgroup float gs[RANK];
++  const uint t = tt.x;
++  if (t < RANK) gs[t] = g[size_t(at.y) * RANK + t];
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  const uint n = at.x;
++  if (n >= D) return;
++  float f = 0.0f, a = 0.0f;
++  for (uint k = 0; k < RANK; ++k) {
++    f += gs[k] * float(wf[n * RANK + k]);
++    a += gs[k] * float(wg[n * RANK + k]);
++  }
++  const float hv = h[size_t(at.y) * strides.x + n], mv = m[size_t(at.y) * strides.y + n];
++  out[size_t(at.y) * D + n] = (1.0f - metal::precise::tanh(f)) * hv + metal::precise::tanh(a) * mv;
++}
++
++// y[row][n] = x[row] . W[n] for a bf16 matrix [N, K] (nn.Linear: FP32 sums), four outputs a threadgroup.
++template <typename TI, typename TO>
++[[kernel]] void ink_dense(const device TI* x [[buffer(0)]], const device bfloat* w [[buffer(1)]], constant uint2& kn [[buffer(2)]],
++                          device TO* y [[buffer(3)]], uint2 g [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
++                          uint lane [[thread_index_in_simdgroup]]) {
++  const uint K = kn.x, N = kn.y, n = g.x * 4 + sg;
++  if (n >= N) return;
++  const device TI* xr = x + size_t(g.y) * K;
++  const device bfloat* wr = w + size_t(n) * K;
++  float acc = 0.0f;
++  for (uint k = lane * 4; k < K; k += 128)
++    for (uint i = 0; i < 4; ++i) acc += float(xr[k + i]) * float(wr[k + i]);
++  acc = simd_sum(acc);
++  if (lane == 0) y[size_t(g.y) * N + n] = TO(acc);
++}
++template [[host_name("ink_dense_bf16_bf16")]] [[kernel]] decltype(ink_dense<bfloat, bfloat>) ink_dense<bfloat, bfloat>;
++template [[host_name("ink_dense_bf16_f32")]] [[kernel]] decltype(ink_dense<bfloat, float>) ink_dense<bfloat, float>;
++
++// 4-tap conv, state [3, C] FP32, y = (conv + x) / sqrt(5): EPI 0 bf16(y), 1 +x, 2 bf16(res + y), 3 y rounded first.
++template <typename TI, int EPI>
++[[kernel]] void ink_conv(const device TI* x [[buffer(0)]], device float* state [[buffer(1)]], const device bfloat* w [[buffer(2)]],
++                         constant uint4& a [[buffer(3)]], device void* outp [[buffer(4)]], const device bfloat* xin [[buffer(5)]],
++                         const device float* res [[buffer(6)]], uint c [[thread_position_in_grid]]) {
++  const uint C = a.x, R = a.y, add = a.z;
++  if (c >= C) return;
++  float s0 = state[c], s1 = state[C + c], s2 = state[2 * C + c];
++  const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
++  const float div = metal::precise::sqrt(5.0f);
++  for (uint t = 0; t < R; ++t) {
++    const size_t at = size_t(t) * C + c;
++    const float xv = float(x[at]);
++    float v = 0.0f;
++    v = v + s0 * w0;
++    v = v + s1 * w1;
++    v = v + s2 * w2;
++    v = v + xv * w3;
++    const float y = (v + xv) / div;
++    if (EPI == 0) ((device bfloat*)outp)[at] = bfloat(y);
++    if (EPI == 1) ((device float*)outp)[at] = float(bfloat(y)) + (add != 0 ? float(xin[at]) : 0.0f);
++    if (EPI == 2) ((device bfloat*)outp)[at] = bfloat(res[at] + y);
++    if (EPI == 3) ((device bfloat*)outp)[at] = bfloat(res[at] + float(bfloat(y)));
++    s0 = s1;
++    s1 = s2;
++    s2 = xv;
++  }
++  state[c] = s0;
++  state[C + c] = s1;
++  state[2 * C + c] = s2;
++}
++template [[host_name("ink_conv_kv")]] [[kernel]] decltype(ink_conv<bfloat, 0>) ink_conv<bfloat, 0>;
++template [[host_name("ink_conv_attn")]] [[kernel]] decltype(ink_conv<bfloat, 1>) ink_conv<bfloat, 1>;
++template [[host_name("ink_conv_mlp")]] [[kernel]] decltype(ink_conv<float, 2>) ink_conv<float, 2>;
++template [[host_name("ink_conv_mlp_bf16")]] [[kernel]] decltype(ink_conv<float, 3>) ink_conv<float, 3>;
++
++// A global layer's k or v conv: taps static[lag][c] + dyn[row][head * 4 + lag], lag 0 the row itself.
++[[kernel]] void ink_conv_dyn(const device bfloat* x [[buffer(0)]], device float* state [[buffer(1)]],
++                             const device bfloat* stat [[buffer(2)]], const device bfloat* dyn [[buffer(3)]],
++                             constant uint& rows [[buffer(4)]], device bfloat* out [[buffer(5)]], uint c [[thread_position_in_grid]]) {
++  constexpr uint C = KVH * HD;
++  if (c >= C) return;
++  const uint h = c / HD;
++  float s0 = state[c], s1 = state[C + c], s2 = state[2 * C + c];
++  for (uint t = 0; t < rows; ++t) {
++    const float xv = float(x[size_t(t) * C + c]);
++    const float vals[4] = {xv, s2, s1, s0};
++    float o = 0.0f;
++    for (uint lag = 0; lag < 4; ++lag) o = o + vals[lag] * (float(stat[lag * C + c]) + float(dyn[size_t(t) * 32 + h * 4 + lag]));
++    out[size_t(t) * C + c] = bfloat((o + xv) / 3.0f);
++    s0 = s1;
++    s1 = s2;
++    s2 = xv;
++  }
++  state[c] = s0;
++  state[C + c] = s1;
++  state[2 * C + c] = s2;
++}
++
++// Top 8 of sigmoid(logit) + bias over 128 experts; weights = sigmoid / sum * scale. One threadgroup of E a row.
++[[kernel]] void ink_route(const device float* logits [[buffer(0)]], const device float* bias [[buffer(1)]], constant float& scale [[buffer(2)]],
++                          device uint* picks [[buffer(3)]], device float* weights [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
++                          uint t [[thread_position_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
++                          uint lane [[thread_index_in_simdgroup]]) {
++  threadgroup float best_v[E / 32];
++  threadgroup uint best_i[E / 32];
++  threadgroup uint chosen[TOPK];
++  threadgroup float chosen_s[TOPK];
++  const float score = 1.0f / (1.0f + metal::precise::exp(-logits[size_t(row) * E + t]));
++  float key = score + bias[t];
++  for (uint k = 0; k < TOPK; ++k) {
++    float v = key;
++    uint i = t;
++    for (uint off = 16; off > 0; off >>= 1) {
++      const float ov = simd_shuffle_down(v, off);
++      const uint oi = simd_shuffle_down(i, off);
++      if (ov > v || (ov == v && oi < i)) {
++        v = ov;
++        i = oi;
++      }
++    }
++    if (lane == 0) {
++      best_v[sg] = v;
++      best_i[sg] = i;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (t == 0) {
++      float bv = best_v[0];
++      uint bi = best_i[0];
++      for (uint s = 1; s < E / 32; ++s)
++        if (best_v[s] > bv || (best_v[s] == bv && best_i[s] < bi)) {
++          bv = best_v[s];
++          bi = best_i[s];
++        }
++      chosen[k] = bi;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (t == chosen[k]) {
++      chosen_s[k] = score;
++      key = -INFINITY;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++  }
++  if (t == 0) {
++    float total = 0.0f;
++    for (uint k = 0; k < TOPK; ++k) total += chosen_s[k];
++    for (uint k = 0; k < TOPK; ++k) {
++      picks[size_t(row) * TOPK + k] = chosen[k];
++      weights[size_t(row) * TOPK + k] = chosen_s[k] / (total + 1e-20f) * scale;
++    }
++  }
++}
++
++// out[row][n] = sum over picks of y[slot][n] * weight[slot], FP32 (rounded to bf16 when `round`: bf16 experts).
++[[kernel]] void ink_combine(const device float* y [[buffer(0)]], const device float* weights [[buffer(1)]], device float* out [[buffer(2)]],
++                            constant uint& round [[buffer(3)]], uint2 at [[thread_position_in_grid]]) {
++  if (at.x >= D) return;
++  float acc = 0.0f;
++  for (uint k = 0; k < TOPK; ++k) {
++    const size_t slot = size_t(at.y) * TOPK + k;
++    acc += y[slot * D + at.x] * weights[slot];
++  }
++  out[size_t(at.y) * D + at.x] = round != 0 ? float(bfloat(acc)) : acc;
++}
++
++// dst[i] = src[i] over bf16 values.
++[[kernel]] void ink_copy(const device bfloat* src [[buffer(0)]], device bfloat* dst [[buffer(1)]], constant uint& n [[buffer(2)]],
++                         uint i [[thread_position_in_grid]]) {
++  if (i < n) dst[i] = src[i];
++}
++
++// logits = tanh(logits / cap) * cap in place, and each row's greedy pick over the first `real` tokens.
++[[kernel]] void ink_head_pick(device float* logits [[buffer(0)]], constant uint3& a [[buffer(1)]], constant float& cap [[buffer(2)]],
++                              device uint* best [[buffer(3)]], uint row [[threadgroup_position_in_grid]],
++                              uint t [[thread_position_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
++                              uint lane [[thread_index_in_simdgroup]], uint n [[threads_per_threadgroup]]) {
++  const uint vocab = a.x, real = a.y;
++  device float* l = logits + size_t(row) * vocab;
++  float bv = -INFINITY;
++  uint bi = 0;
++  for (uint i = t; i < vocab; i += n) {
++    const float v = metal::precise::tanh(l[i] / cap) * cap;
++    l[i] = v;
++    if (i < real && v > bv) {
++      bv = v;
++      bi = i;
++    }
++  }
++  for (uint off = 16; off > 0; off >>= 1) {
++    const float ov = simd_shuffle_down(bv, off);
++    const uint oi = simd_shuffle_down(bi, off);
++    if (ov > bv || (ov == bv && oi < bi)) {
++      bv = ov;
++      bi = oi;
++    }
++  }
++  threadgroup float vs[32];
++  threadgroup uint is[32];
++  if (lane == 0) {
++    vs[sg] = bv;
++    is[sg] = bi;
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  if (t == 0) {
++    for (uint s = 1; s < n / 32; ++s)
++      if (vs[s] > bv || (vs[s] == bv && is[s] < bi)) {
++        bv = vs[s];
++        bi = is[s];
++      }
++    best[row] = bi;
++  }
++}
+diff --git a/zig/kernels/metal/inkling2/inkling2_attn.metal b/zig/kernels/metal/inkling2/inkling2_attn.metal
+new file mode 100644
+index 0000000..4465bbb
+--- /dev/null
++++ b/zig/kernels/metal/inkling2/inkling2_attn.metal
+@@ -0,0 +1,128 @@
++// Inkling 2 Mini's q/r/k/v preparation and banded-bias sink attention, after inkling2.metal's text (its constants).
++
++struct PrepArgs {
++  uint pos0;     // the stream's cached rows before this call
++  uint global;   // a global layer: q and r take the log scale
++  float qk_clip;
++  float rel_clip;
++  float eps;
++  float log_floor;
++  float log_alpha;
++  uint pad;
++};
++
++// One job a simdgroup: 24 q heads, 24 r heads, 8 k heads (into the cache), 8 v heads (into the cache), of one row.
++[[kernel]] void ink_prep(const device bfloat* q [[buffer(0)]], const device bfloat* r [[buffer(1)]], const device bfloat* k [[buffer(2)]],
++                         const device bfloat* v [[buffer(3)]], const device bfloat* qscale [[buffer(4)]],
++                         const device bfloat* rscale [[buffer(5)]], constant PrepArgs& a [[buffer(6)]], device bfloat* qo [[buffer(7)]],
++                         device bfloat* ro [[buffer(8)]], device bfloat* kc [[buffer(9)]], device bfloat* vc [[buffer(10)]],
++                         uint2 g [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
++  const uint job = g.x, row = g.y, pos = a.pos0 + row;
++  float tau = 1.0f;
++  if (a.global != 0) tau = 1.0f + a.log_alpha * metal::precise::log(max(float(pos + 1) / a.log_floor, 1.0f));
++  if (job < QH) {
++    const uint h = job;
++    float x[4];
++    float sq = 0.0f;
++    for (uint i = 0; i < 4; ++i) {
++      const uint d = lane * 4 + i;
++      x[i] = float(q[size_t(row) * QH * HD + h * HD + d]) * float(qscale[h * HD + d]);
++      sq += x[i] * x[i];
++    }
++    const float f = min(a.qk_clip / (metal::precise::sqrt(simd_sum(sq)) + 1e-6f), 1.0f);
++    for (uint i = 0; i < 4; ++i) {
++      bfloat y = bfloat(x[i] * f);
++      if (a.global != 0) y = bfloat(float(y) * tau);
++      qo[size_t(row) * QH * HD + h * HD + lane * 4 + i] = y;
++    }
++  } else if (job < 2 * QH) {
++    const uint h = job - QH;
++    const float x = lane < DREL ? float(r[size_t(row) * QH * DREL + h * DREL + lane]) * float(rscale[h * DREL + lane]) : 0.0f;
++    const float f = min(a.rel_clip / (metal::precise::sqrt(simd_sum(x * x)) + 1e-6f), 1.0f);
++    if (lane < DREL) {
++      bfloat y = bfloat(x * f);
++      if (a.global != 0) y = bfloat(float(y) * tau);
++      ro[size_t(row) * QH * DREL + h * DREL + lane] = y;
++    }
++  } else if (job < 2 * QH + KVH) {
++    const uint h = job - 2 * QH;
++    float x[4];
++    float sq = 0.0f;
++    for (uint i = 0; i < 4; ++i) {
++      x[i] = float(k[size_t(row) * KVH * HD + h * HD + lane * 4 + i]);
++      sq += x[i] * x[i];
++    }
++    const float f = min(a.qk_clip / (metal::precise::sqrt(simd_sum(sq)) + 1e-6f), 1.0f);
++    for (uint i = 0; i < 4; ++i) kc[(size_t(pos) * KVH + h) * HD + lane * 4 + i] = bfloat(x[i] * f);
++  } else {
++    const uint h = job - 2 * QH - KVH;
++    float x[4];
++    float sq = 0.0f;
++    for (uint i = 0; i < 4; ++i) {
++      x[i] = float(v[size_t(row) * KVH * HD + h * HD + lane * 4 + i]);
++      sq += x[i] * x[i];
++    }
++    const float inv = metal::precise::rsqrt(simd_sum(sq) / float(HD) + a.eps);
++    for (uint i = 0; i < 4; ++i) vc[(size_t(pos) * KVH + h) * HD + lane * 4 + i] = bfloat(x[i] * inv);
++  }
++}
++
++struct AttnArgs {
++  uint pos0;    // the first row's position
++  uint sliding; // keys within EXT - 1 back only
++  float scale;
++  uint pad;
++};
++
++// One head of one row: q . k * scale + bf16(r . rel_proj[:, dist]) in the extent, a zero-value sink, sigmoid gate.
++[[kernel]] void ink_attn(const device bfloat* q [[buffer(0)]], const device bfloat* r [[buffer(1)]], const device bfloat* sink [[buffer(2)]],
++                         const device bfloat* gate [[buffer(3)]], const device bfloat* kc [[buffer(4)]], const device bfloat* vc [[buffer(5)]],
++                         const device bfloat* relp [[buffer(6)]], constant AttnArgs& a [[buffer(7)]], device bfloat* out [[buffer(8)]],
++                         uint2 g [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
++                         uint lane [[thread_index_in_simdgroup]]) {
++  constexpr uint NSG = 8;
++  const uint h = g.x, row = g.y, kvh = h / (QH / KVH), pos = a.pos0 + row;
++  const uint lo = a.sliding != 0 && pos >= EXT - 1 ? pos - (EXT - 1) : 0;
++  float qv[4];
++  for (uint i = 0; i < 4; ++i) qv[i] = float(q[size_t(row) * QH * HD + h * HD + lane * 4 + i]) * a.scale;
++  const float rv = lane < DREL ? float(r[size_t(row) * QH * DREL + h * DREL + lane]) : 0.0f;
++  float m = -INFINITY, l = 0.0f, acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++  for (uint j = lo + sg; j <= pos; j += NSG) {
++    const device bfloat* kp = kc + (size_t(j) * KVH + kvh) * HD + lane * 4;
++    float s = 0.0f;
++    for (uint i = 0; i < 4; ++i) s += qv[i] * float(kp[i]);
++    s = simd_sum(s);
++    const uint dist = pos - j;
++    if (dist < EXT) s += float(bfloat(simd_sum(lane < DREL ? rv * float(relp[lane * EXT + dist]) : 0.0f)));
++    const float mn = max(m, s);
++    const float corr = metal::precise::exp(m - mn), p = metal::precise::exp(s - mn);
++    const device bfloat* vp = vc + (size_t(j) * KVH + kvh) * HD + lane * 4;
++    l = l * corr + p;
++    for (uint i = 0; i < 4; ++i) acc[i] = acc[i] * corr + p * float(vp[i]);
++    m = mn;
++  }
++  threadgroup float ms[NSG], ls[NSG], accs[NSG][HD];
++  if (lane == 0) {
++    ms[sg] = m;
++    ls[sg] = l;
++  }
++  for (uint i = 0; i < 4; ++i) accs[sg][lane * 4 + i] = acc[i];
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  if (sg != 0) return;
++  const float ss = float(sink[size_t(row) * QH + h]);
++  float top = ss;
++  for (uint s = 0; s < NSG; ++s) top = max(top, ms[s]);
++  float total = metal::precise::exp(ss - top);
++  float o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++  for (uint s = 0; s < NSG; ++s) {
++    if (ms[s] == -INFINITY) continue;
++    const float w = metal::precise::exp(ms[s] - top);
++    total += ls[s] * w;
++    for (uint i = 0; i < 4; ++i) o[i] += accs[s][lane * 4 + i] * w;
++  }
++  for (uint i = 0; i < 4; ++i) {
++    const size_t at = size_t(row) * QH * HD + h * HD + lane * 4 + i;
++    const float gv = float(gate[at]);
++    out[at] = bfloat(float(bfloat(o[i] / total)) * (1.0f / (1.0f + metal::precise::exp(-gv))));
++  }
++}
+diff --git a/zig/kernels/metal/inkling2/inkling2_experts.metal b/zig/kernels/metal/inkling2/inkling2_experts.metal
+new file mode 100644
+index 0000000..ea107cf
+--- /dev/null
++++ b/zig/kernels/metal/inkling2/inkling2_experts.metal
+@@ -0,0 +1,77 @@
++// Affine row matmuls in the tables' dtype: routed experts and the FP32-logit head, after inkling2.metal's text.
++
++struct QmvArgs {
++  uint k;       // inputs a row
++  uint n;       // outputs a matrix
++  uint repeat;  // slots that share one input row (a token's picks)
++  uint indexed; // slot s reads matrix ids[s]; else matrix 0
++};
++
++// Chunk c's eight codes (8 * BITS bits, byte aligned) dotted with x: scale * sum(x q) + bias * sum(x).
++template <int BITS, typename TT>
++inline float ink_chunk(const device uint8_t* row, uint c, const thread float* xv, float xs, TT s, TT b) {
++  const device uint8_t* p = row + c * BITS;
++  ulong word = 0;
++  for (int i = 0; i < BITS; ++i) word |= ulong(p[i]) << (8 * i);
++  float acc = 0.0f;
++  for (int i = 0; i < 8; ++i) acc += xv[i] * float((word >> (BITS * i)) & ((1ul << BITS) - 1));
++  return float(s) * acc + float(b) * xs;
++}
++
++// The softcapped SwiGLU: tanh(g / 4) * 4 * sigmoid(g) * tanh(u / 25) * 25, FP32.
++inline float ink_swiglu(float g, float u) {
++  const float sg = 1.0f / (1.0f + metal::precise::exp(-g));
++  return metal::precise::tanh(g / 4.0f) * 4.0f * sg * (metal::precise::tanh(u / 25.0f) * 25.0f);
++}
++
++// y[slot][n] = x[slot / repeat] . W_e[n] (GLU: SwiGLU of W_e, W2_e); RB rounds to bf16 as MLX's bf16 tables do.
++template <int BITS, typename TT, typename TI, bool GLU, bool RB>
++[[kernel]] void ink_qmv(const device TI* x [[buffer(0)]], const device uint8_t* w [[buffer(1)]], const device TT* s [[buffer(2)]],
++                        const device TT* b [[buffer(3)]], constant QmvArgs& a [[buffer(4)]], device float* y [[buffer(5)]],
++                        const device uint* ids [[buffer(6)]], const device uint8_t* w2 [[buffer(7)]], const device TT* s2 [[buffer(8)]],
++                        const device TT* b2 [[buffer(9)]], uint2 g [[threadgroup_position_in_grid]],
++                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
++  const uint K = a.k, N = a.n, slot = g.y;
++  const ulong e = a.indexed != 0 ? ids[slot] : 0;
++  const ulong row_bytes = ulong(K) * BITS / 8, groups = K / 64;
++  const device TI* xr = x + size_t(slot / a.repeat) * K;
++  const uint n0 = g.x * 8 + sg * 4;
++  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f}, acc2[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++  for (uint c = lane; c < K / 8; c += 32) {
++    float xv[8];
++    float xs = 0.0f;
++    for (uint i = 0; i < 8; ++i) {
++      xv[i] = float(xr[c * 8 + i]);
++      xs += xv[i];
++    }
++    const uint gi = c / 8;
++    for (uint r = 0; r < 4; ++r) {
++      const ulong m = e * N + n0 + r;
++      acc[r] += ink_chunk<BITS, TT>(w + m * row_bytes, c, xv, xs, s[m * groups + gi], b[m * groups + gi]);
++      if (GLU) acc2[r] += ink_chunk<BITS, TT>(w2 + m * row_bytes, c, xv, xs, s2[m * groups + gi], b2[m * groups + gi]);
++    }
++  }
++  for (uint r = 0; r < 4; ++r) {
++    acc[r] = simd_sum(acc[r]);
++    if (GLU) acc2[r] = simd_sum(acc2[r]);
++  }
++  if (lane == 0)
++    for (uint r = 0; r < 4; ++r) {
++      float o = acc[r];
++      if (RB) o = float(bfloat(o));
++      if (GLU) o = RB ? float(bfloat(ink_swiglu(o, float(bfloat(acc2[r]))))) : ink_swiglu(o, acc2[r]);
++      y[size_t(slot) * N + n0 + r] = o;
++    }
++}
++template [[host_name("ink_glu_q3")]] [[kernel]] decltype(ink_qmv<3, float, bfloat, true, false>) ink_qmv<3, float, bfloat, true, false>;
++template [[host_name("ink_glu_q4")]] [[kernel]] decltype(ink_qmv<4, float, bfloat, true, false>) ink_qmv<4, float, bfloat, true, false>;
++template [[host_name("ink_down_q3")]] [[kernel]] decltype(ink_qmv<3, float, float, false, false>) ink_qmv<3, float, float, false, false>;
++template [[host_name("ink_down_q4")]] [[kernel]] decltype(ink_qmv<4, float, float, false, false>) ink_qmv<4, float, float, false, false>;
++template [[host_name("ink_head_q4")]] [[kernel]] decltype(ink_qmv<4, bfloat, bfloat, false, false>) ink_qmv<4, bfloat, bfloat, false, false>;
++template [[host_name("ink_head_q6")]] [[kernel]] decltype(ink_qmv<6, bfloat, bfloat, false, false>) ink_qmv<6, bfloat, bfloat, false, false>;
++template [[host_name("ink_head_q8")]] [[kernel]] decltype(ink_qmv<8, bfloat, bfloat, false, false>) ink_qmv<8, bfloat, bfloat, false, false>;
++template [[host_name("ink_glu_q4_bf16")]] [[kernel]] decltype(ink_qmv<4, bfloat, bfloat, true, true>) ink_qmv<4, bfloat, bfloat, true, true>;
++template [[host_name("ink_glu_q3_bf16")]] [[kernel]] decltype(ink_qmv<3, bfloat, bfloat, true, true>) ink_qmv<3, bfloat, bfloat, true, true>;
++template [[host_name("ink_down_q4_bf16")]] [[kernel]] decltype(ink_qmv<4, bfloat, float, false, true>) ink_qmv<4, bfloat, float, false, true>;
++template [[host_name("ink_down_q3_bf16")]] [[kernel]] decltype(ink_qmv<3, bfloat, float, false, true>) ink_qmv<3, bfloat, float, false, true>;
++
+diff --git a/zig/kernels/metal/sources.zig b/zig/kernels/metal/sources.zig
+index eda8cde..4fcdf06 100644
+--- a/zig/kernels/metal/sources.zig
++++ b/zig/kernels/metal/sources.zig
+@@ -47,6 +47,8 @@ pub const gemma4_vision = vision_glue ++ @embedFile("gemma4/vision.metal");
+ pub const lfm2 = @embedFile("lfm2/lfm2.metal") ++ @embedFile("lfm2/lfm2_segments.metal");
+ /// LFM2's prompt attention on the tensor units (nax.h inlined at load, after lfm2.metal's text).
+ pub const lfm2_attn_nax = @embedFile("lfm2/lfm2_attn_nax.metal");
++/// Inkling 2 Mini: glue, the loop's gates, banded-bias sink attention, FP32-table experts and the head.
++pub const inkling2 = @embedFile("inkling2/inkling2.metal") ++ @embedFile("inkling2/inkling2_attn.metal") ++ @embedFile("inkling2/inkling2_experts.metal");
+ pub const nemotron_prompt_masked = @import("nemotron/prompt_masked.zig");
+ 
+ pub const lfm3 = @embedFile("lfm3/ops.metal");
+diff --git a/zig/src/families/inkling2/config.zig b/zig/src/families/inkling2/config.zig
+index b414360..5afa756 100644
+--- a/zig/src/families/inkling2/config.zig
++++ b/zig/src/families/inkling2/config.zig
+@@ -1,5 +1,6 @@
+ //! Inkling 2 Small's shape from config.json (inkling2), refusing every layout the engine does not run.
+ const std = @import("std");
++const loop_plan = @import("loop.zig");
+ 
+ /// The most backbone layers the plan tables hold (Inkling 2 Small has 48).
+ pub const max_layers = 128;
+@@ -100,12 +101,24 @@ pub const Vision = struct {
+     text_hidden: u32,
+ };
+ 
++/// How the checkpoint stores its weights: ModelOpt NVFP4/MXFP8 experts, or MLX affine codes.
++pub const Format = enum { modelopt, mlx_affine };
++
+ pub const Config = struct {
+     text: Text,
+     vision: Vision,
+     mtp: ?Mtp,
+     eos: u32,
+     image_token: u32,
++    /// Inkling 2 Mini's loop (inkling2_loop); null for Inkling 2 Small.
++    loop: ?loop_plan.Loop = null,
++    format: Format = .modelopt,
++
++    /// Layer visits a token makes: the layers, plus the loop's extra passes.
++    pub fn visits(c: *const Config) u32 {
++        const l = c.loop orelse return c.text.layers;
++        return loop_plan.total(c.text.layers, l);
++    }
+ };
+ 
+ fn get(o: std.json.ObjectMap, key: []const u8, why: *Why) !std.json.Value {
+@@ -284,7 +297,7 @@ fn parseVision(o: std.json.ObjectMap, text_hidden: u32, why: *Why) !Vision {
+     return v;
+ }
+ 
+-fn parseMtp(o: std.json.ObjectMap, t: *const Text, why: *Why) !Mtp {
++fn parseMtp(o: std.json.ObjectMap, t: *const Text, visits: u32, why: *Why) !Mtp {
+     var m = std.mem.zeroes(Mtp);
+     m.layers = try int(o, "num_hidden_layers", why);
+     m.q_heads = try int(o, "num_attention_heads", why);
+@@ -311,7 +324,7 @@ fn parseMtp(o: std.json.ObjectMap, t: *const Text, why: *Why) !Mtp {
+         m.local[@intCast(e.integer)] = true;
+     }
+     for (taps.array.items) |e| {
+-        if (e != .integer or e.integer < 0 or e.integer > t.layers) {
++        if (e != .integer or e.integer < 0 or e.integer > visits) {
+             why.set("mtp_config's target_layer_ids names a layer the backbone does not have", .{});
+             return error.Layout;
+         }
+@@ -321,19 +334,48 @@ fn parseMtp(o: std.json.ObjectMap, t: *const Text, why: *Why) !Mtp {
+     return m;
+ }
+ 
+-/// A quantization_config in config.json must be ModelOpt NVFP4, which the experts' header dtype refines per layer.
+-fn quantization(o: std.json.ObjectMap, why: *Why) !void {
+-    const v = o.get("quantization_config") orelse return;
++/// An MLX affine quantization_config: mode affine (or absent), a group of 32, 64 or 128 and 2 to 8 bits.
++fn mlxAffine(q: std.json.ObjectMap) bool {
++    if (text(q, "quant_method") != null) return false;
++    if (text(q, "mode")) |m| if (!std.mem.eql(u8, m, "affine")) return false;
++    const g = q.get("group_size") orelse return false;
++    const b = q.get("bits") orelse return false;
++    if (g != .integer or b != .integer) return false;
++    return (g.integer == 32 or g.integer == 64 or g.integer == 128) and b.integer >= 2 and b.integer <= 8;
++}
++
++/// quantization_config: ModelOpt NVFP4 (refined per layer by the experts' dtype), or MLX affine when `mlx` allows it.
++fn quantization(o: std.json.ObjectMap, mlx: bool, why: *Why) !Format {
++    const v = o.get("quantization_config") orelse return .modelopt;
+     const q = if (v == .object) v.object else {
+         why.set("quantization_config is not an object", .{});
+         return error.Quant;
+     };
++    if (mlx and mlxAffine(q)) return .mlx_affine;
+     const ok = std.ascii.eqlIgnoreCase(text(q, "quant_method") orelse "", "modelopt") and
+         std.ascii.eqlIgnoreCase(text(q, "quant_algo") orelse "", "NVFP4");
+     if (!ok) {
+         why.set("quantization_config: the loader reads ModelOpt NVFP4 experts (MXFP8 layers follow from their tensors)", .{});
+         return error.Quant;
+     }
++    return .modelopt;
++}
++
++/// text_config's loop_config (inkling2_loop): a fixed loop of whole passes over a core of layers.
++fn parseLoop(o: std.json.ObjectMap, layers: u32, why: *Why) !loop_plan.Loop {
++    const l = try object(o, "loop_config", why);
++    try fixed(l, "is_varloop", false, why);
++    const out: loop_plan.Loop = .{
++        .start = try int(l, "core_start", why),
++        .end = try int(l, "core_end", why),
++        .passes = try int(l, "num_passes", why),
++        .rank = try int(l, "gate_rank", why),
++    };
++    if (out.start >= out.end or out.end > layers or out.passes > 8) {
++        why.set("loop_config: a core [{d}, {d}) inside the {d} layers and at most 8 passes", .{ out.start, out.end, layers });
++        return error.Layout;
++    }
++    return out;
+ }
+ 
+ /// config.json as the reference (configuration_inkling2.py) and the checkpoint read it; a refusal is in `why`.
+@@ -349,21 +391,29 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, why: *Why) !Config {
+     }
+     const o = parsed.value.object;
+     const arch = o.get("architectures");
+-    const ok = arch != null and arch.? == .array and arch.?.array.items.len == 1 and arch.?.array.items[0] == .string and
+-        std.mem.eql(u8, arch.?.array.items[0].string, "Inkling2ForConditionalGeneration");
+-    if (!ok or !std.mem.eql(u8, text(o, "model_type") orelse "", "inkling2")) {
+-        why.set("not an Inkling 2 checkpoint: architectures Inkling2ForConditionalGeneration, model_type inkling2", .{});
++    const name = if (arch != null and arch.? == .array and arch.?.array.items.len == 1 and arch.?.array.items[0] == .string)
++        arch.?.array.items[0].string
++    else
++        "";
++    const kind = text(o, "model_type") orelse "";
++    const small = std.mem.eql(u8, name, "Inkling2ForConditionalGeneration") and std.mem.eql(u8, kind, "inkling2");
++    const mini = std.mem.eql(u8, name, "Inkling2LoopForConditionalGeneration") and std.mem.eql(u8, kind, "inkling2_loop");
++    if (!small and !mini) {
++        why.set("not an Inkling 2 checkpoint: Inkling2ForConditionalGeneration (inkling2) or its loop (inkling2_loop)", .{});
+         return error.NotInkling2;
+     }
+     try fixed(o, "tie_word_embeddings", false, why);
+-    try quantization(o, why);
+-    const t = try parseText(try object(o, "text_config", why), why);
++    const format = try quantization(o, mini, why);
++    const text_config = try object(o, "text_config", why);
++    const t = try parseText(text_config, why);
++    const loop = if (mini) try parseLoop(text_config, t.layers, why) else null;
++    const visits = if (loop) |l| loop_plan.total(t.layers, l) else t.layers;
+     const eos = try int(o, "eos_token_id", why);
+     if (eos >= t.vocab) {
+         why.set("eos_token_id is not a token of the {d}-token vocabulary", .{t.vocab});
+         return error.BadConfig;
+     }
+-    const mtp = if (o.get("mtp_config") != null) try parseMtp(try object(o, "mtp_config", why), &t, why) else null;
++    const mtp = if (o.get("mtp_config") != null) try parseMtp(try object(o, "mtp_config", why), &t, visits, why) else null;
+     const image = if (o.get("image_token_id") != null) try int(o, "image_token_id", why) else default_image_token;
+     return .{
+         .text = t,
+@@ -371,5 +421,7 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, why: *Why) !Config {
+         .mtp = mtp,
+         .eos = eos,
+         .image_token = image,
++        .loop = loop,
++        .format = format,
+     };
+ }
+diff --git a/zig/src/families/inkling2/config_test.zig b/zig/src/families/inkling2/config_test.zig
+index 3d24d54..066ca2f 100644
+--- a/zig/src/families/inkling2/config_test.zig
++++ b/zig/src/families/inkling2/config_test.zig
+@@ -121,3 +121,31 @@ test "a scoring function, a layer count, a quantization_config and a root that t
+     try t.expectError(error.BadConfig, config.parse(t.allocator, "{", &why));
+     try t.expectEqualStrings("config.json is not JSON", why.text());
+ }
++
++pub const mini_mlx = @embedFile("fixtures/mini_mlx_config.json");
++
++test "Inkling 2 Mini's MLX config.json parses: 24 layers, a loop of 6-17 three times, 48 visits, taps by visit" {
++    var why: config.Why = .{};
++    const c = try config.parse(t.allocator, mini_mlx, &why);
++    try t.expectEqual(@as(u32, 2304), c.text.hidden);
++    try t.expectEqual(@as(u32, 24), c.text.layers);
++    try t.expectEqual(@as(u32, 128), c.text.experts);
++    try t.expectEqual(@as(u32, 1152), c.text.expert_inter);
++    try t.expectEqual(@as(u32, 8192), c.text.log_floor);
++    try t.expectEqual(config.Format.mlx_affine, c.format);
++    const l = c.loop.?;
++    try t.expectEqual(@as(u32, 6), l.start);
++    try t.expectEqual(@as(u32, 18), l.end);
++    try t.expectEqual(@as(u32, 3), l.passes);
++    try t.expectEqual(@as(u32, 64), l.rank);
++    try t.expectEqual(@as(u32, 48), c.visits());
++    try t.expectEqualSlices(u32, &.{ 5, 23, 41, 48 }, c.mtp.?.taps[0..c.mtp.?.taps_n]);
++}
++
++test "Mini's varloop, a loop past the layers and a non-affine MLX mode are refused; Small takes no loop" {
++    try refused(mini_mlx, "\"is_varloop\": false", "\"is_varloop\": true", error.Unsupported, "is_varloop must be false");
++    try refused(mini_mlx, "\"core_end\": 18", "\"core_end\": 25", error.Layout, "loop_config");
++    try refused(mini_mlx, "\"bits\": 3,\n    \"mode\": \"affine\"\n  }\n}", "\"bits\": 3,\n    \"mode\": \"mxfp4\"\n  }\n}", error.Quant, "ModelOpt");
++    var why: config.Why = .{};
++    try t.expect((try config.parse(t.allocator, tiny, &why)).loop == null);
++}
+diff --git a/zig/src/families/inkling2/fixtures/mini_mlx_config.json b/zig/src/families/inkling2/fixtures/mini_mlx_config.json
+new file mode 100644
+index 0000000..6a17561
+--- /dev/null
++++ b/zig/src/families/inkling2/fixtures/mini_mlx_config.json
+@@ -0,0 +1,135 @@
++{
++  "architectures": [
++    "Inkling2LoopForConditionalGeneration"
++  ],
++  "do_sample": true,
++  "eos_token_id": 200006,
++  "generation_config": {
++    "do_sample": true,
++    "temperature": 1.0,
++    "eos_token_id": 200006,
++    "pad_token_id": 199999
++  },
++  "model_type": "inkling2_loop",
++  "mtp_config": {
++    "hidden_size": 2304,
++    "num_hidden_layers": 3,
++    "num_attention_heads": 24,
++    "num_key_value_heads": 8,
++    "head_dim": 128,
++    "intermediate_size": 9216,
++    "max_position_embeddings": 1048576,
++    "torch_dtype": "bfloat16",
++    "q_bias": false,
++    "o_bias": false,
++    "rms_norm_eps": 1e-06,
++    "rope_theta": 1000000.0,
++    "local_layer_ids": [
++      0,
++      2
++    ],
++    "sliding_window_size": 1024,
++    "block_size": 8,
++    "markov_rank": 256,
++    "markov_head_type": "rnn_hidden",
++    "target_layer_ids": [
++      5,
++      23,
++      41,
++      48
++    ]
++  },
++  "temperature": 1.0,
++  "text_config": {
++    "model_type": "inkling2_loop_text",
++    "model_max_length": 1048576,
++    "torch_dtype": "bfloat16",
++    "hidden_size": 2304,
++    "num_hidden_layers": 24,
++    "vocab_size": 201024,
++    "num_attention_heads": 24,
++    "num_key_value_heads": 8,
++    "head_dim": 128,
++    "d_rel": 16,
++    "rel_extent": 1024,
++    "q_bias": false,
++    "o_bias": false,
++    "log_scaling_n_floor": 8192,
++    "log_scaling_alpha": 0.1,
++    "rms_norm_eps": 1e-06,
++    "use_value_norm_no_gamma": true,
++    "qk_l2_clip_threshold": 22.627416997969522,
++    "rel_l2_clip_threshold": 8.0,
++    "local_layer_ids": [
++      0,
++      1,
++      2,
++      3,
++      4,
++      6,
++      7,
++      8,
++      9,
++      10,
++      12,
++      13,
++      14,
++      15,
++      16,
++      18,
++      19,
++      20,
++      21,
++      22
++    ],
++    "sconv_kernel_size": 4,
++    "unpadded_vocab_size": 200058,
++    "final_logit_softcapping": 30.0,
++    "swa_head_dim": 128,
++    "swa_num_attention_heads": 24,
++    "swa_num_key_value_heads": 8,
++    "sliding_window_size": 1024,
++    "n_layers_per_attn_res_block": 6,
++    "attn_res_normalize_values": true,
++    "n_routed_experts": 128,
++    "num_experts_per_tok": 8,
++    "n_shared_experts": 0,
++    "intermediate_size": 1152,
++    "mlp_gate_softcap": 4.0,
++    "mlp_up_softcap": 25.0,
++    "route_scale": 8.0,
++    "use_gate_bias": true,
++    "loop_config": {
++      "core_start": 6,
++      "core_end": 18,
++      "num_passes": 3,
++      "gate_rank": 64,
++      "is_varloop": false
++    }
++  },
++  "vision_config": {
++    "model_type": "inkling2_vision",
++    "text_hidden_size": 2304,
++    "temporal_patch_size": 2,
++    "native_patch_size": 20,
++    "adapter_merge_size": 2,
++    "projection_hidden_dim": 4096,
++    "projector_bias": false,
++    "hidden_size": 1024,
++    "num_hidden_layers": 23,
++    "num_attention_heads": 16,
++    "mlp_ratio": 4.0,
++    "posemb_grid_size": 32,
++    "layer_norm_eps": 1e-05
++  },
++  "quantization": {
++    "group_size": 64,
++    "bits": 3,
++    "mode": "affine"
++  },
++  "quantization_config": {
++    "group_size": 64,
++    "bits": 3,
++    "mode": "affine"
++  }
++}
+diff --git a/zig/src/families/inkling2/host_test.zig b/zig/src/families/inkling2/host_test.zig
+index 4f8b47e..7478be9 100644
+--- a/zig/src/families/inkling2/host_test.zig
++++ b/zig/src/families/inkling2/host_test.zig
+@@ -5,6 +5,8 @@ test {
+     _ = @import("names.zig");
+     _ = @import("names_test.zig");
+     _ = @import("plan.zig");
++    _ = @import("loop.zig");
++    _ = @import("metal/geometry.zig");
+     _ = @import("prompt.zig");
+     _ = @import("template_test.zig");
+     _ = @import("tokenizer_test.zig");
+diff --git a/zig/src/families/inkling2/loop.zig b/zig/src/families/inkling2/loop.zig
+new file mode 100644
+index 0000000..af420fa
+--- /dev/null
++++ b/zig/src/families/inkling2/loop.zig
+@@ -0,0 +1,65 @@
++//! Inkling 2 Mini's loop (inkling2_loop): which layer each visit runs, in which pass, on which cache slot.
++const std = @import("std");
++
++/// loop_config: layers [start, end) run `passes` times; their message gates have rank `rank`.
++pub const Loop = struct { start: u32, end: u32, passes: u32, rank: u32 };
++
++/// One layer visit: the stored layer it runs, its pass (0 for every layer outside the core) and its cache slot.
++pub const Visit = struct { layer: u32, pass: u32, slot: u32 };
++
++/// Layer visits a token makes: every layer once, plus the core again for each extra pass.
++pub fn total(layers: u32, l: Loop) u32 {
++    return layers + (l.passes - 1) * (l.end - l.start);
++}
++
++/// The visits in order; pass p > 0 of core layer i uses slot `layers + (p - 1) * core + (i - start)`.
++pub fn plan(layers: u32, l: Loop, out: []Visit) error{LoopPlan}![]Visit {
++    if (l.start >= l.end or l.end > layers or l.passes == 0) return error.LoopPlan;
++    const n = total(layers, l);
++    if (out.len < n) return error.LoopPlan;
++    const core = l.end - l.start;
++    var at: usize = 0;
++    for (0..l.start) |i| {
++        out[at] = .{ .layer = @intCast(i), .pass = 0, .slot = @intCast(i) };
++        at += 1;
++    }
++    for (0..l.passes) |p| for (l.start..l.end) |i| {
++        const slot: u32 = if (p == 0) @intCast(i) else layers + @as(u32, @intCast(p - 1)) * core + @as(u32, @intCast(i)) - l.start;
++        out[at] = .{ .layer = @intCast(i), .pass = @intCast(p), .slot = slot };
++        at += 1;
++    };
++    for (l.end..layers) |i| {
++        out[at] = .{ .layer = @intCast(i), .pass = 0, .slot = @intCast(i) };
++        at += 1;
++    }
++    return out[0..n];
++}
++
++const t = std.testing;
++const mini: Loop = .{ .start = 6, .end = 18, .passes = 3, .rank = 64 };
++
++test "Mini makes 48 visits over 24 layers: 6, then 6-17 three times, then 18-23" {
++    var buf: [64]Visit = undefined;
++    const v = try plan(24, mini, &buf);
++    try t.expectEqual(@as(usize, 48), v.len);
++    try t.expectEqual(Visit{ .layer = 5, .pass = 0, .slot = 5 }, v[5]);
++    try t.expectEqual(Visit{ .layer = 6, .pass = 0, .slot = 6 }, v[6]);
++    try t.expectEqual(Visit{ .layer = 17, .pass = 0, .slot = 17 }, v[17]);
++    try t.expectEqual(Visit{ .layer = 6, .pass = 1, .slot = 24 }, v[18]);
++    try t.expectEqual(Visit{ .layer = 17, .pass = 2, .slot = 47 }, v[41]);
++    try t.expectEqual(Visit{ .layer = 18, .pass = 0, .slot = 18 }, v[42]);
++    try t.expectEqual(Visit{ .layer = 23, .pass = 0, .slot = 23 }, v[47]);
++    var seen: [48]bool = @splat(false);
++    for (v) |x| {
++        try t.expect(!seen[x.slot]);
++        seen[x.slot] = true;
++    }
++}
++
++test "a loop past the layers, empty or with no passes is refused" {
++    var buf: [64]Visit = undefined;
++    try t.expectError(error.LoopPlan, plan(24, .{ .start = 6, .end = 25, .passes = 3, .rank = 64 }, &buf));
++    try t.expectError(error.LoopPlan, plan(24, .{ .start = 6, .end = 6, .passes = 3, .rank = 64 }, &buf));
++    try t.expectError(error.LoopPlan, plan(24, .{ .start = 6, .end = 18, .passes = 0, .rank = 64 }, &buf));
++    try t.expectError(error.LoopPlan, plan(24, mini, buf[0..47]));
++}
+diff --git a/zig/src/families/inkling2/metal/encode.zig b/zig/src/families/inkling2/metal/encode.zig
+new file mode 100644
+index 0000000..f70c402
+--- /dev/null
++++ b/zig/src/families/inkling2/metal/encode.zig
+@@ -0,0 +1,142 @@
++//! The forward's dispatch helpers: one serial compute encoder, every family kernel and the core row projections.
++const std = @import("std");
++const mtl = @import("metal");
++const row = @import("../../../core/row_projection.zig");
++const g = @import("geometry.zig");
++const st = @import("state.zig");
++const wts = @import("weights.zig");
++const Model = @import("model.zig").Model;
++const Buffer = mtl.Buffer;
++
++/// A buffer at a byte offset.
++pub const Ref = struct { buf: Buffer, off: usize = 0 };
++
++pub fn at(buf: Buffer, off: usize) Ref {
++    return .{ .buf = buf, .off = off };
++}
++
++pub fn of(t: wts.Tensor) Ref {
++    return .{ .buf = t.buffer, .off = t.offset };
++}
++
++/// The attention-residual mix's constants (MixArgs in inkling2.metal).
++const MixArgs = extern struct { nb: u32, nq: u32, stride: u32, pstride: u32 };
++/// The experts' and head's constants (QmvArgs).
++pub const QmvArgs = extern struct { k: u32, n: u32, repeat: u32, indexed: u32 };
++
++pub const Enc = struct {
++    e: mtl.ComputeEncoder,
++    m: *const Model,
++    s: *st.Scratch,
++    rows: usize,
++
++    pub fn pipe(x: Enc, comptime key: []const u8) void {
++        x.e.setPipeline(x.m.kernels.get(key));
++    }
++    pub fn bind(x: Enc, r: Ref, slot: usize) void {
++        x.e.setBuffer(r.buf, r.off, slot);
++    }
++    pub fn value(x: Enc, v: anytype, slot: usize) void {
++        x.e.setValue(v, slot);
++    }
++    pub fn groups(x: Enc, grid: [3]usize, group: [3]usize) void {
++        x.e.dispatchGroups(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
++    }
++    pub fn threads(x: Enc, grid: [3]usize, group: [3]usize) void {
++        x.e.dispatchThreads(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
++    }
++
++    /// y[rows] = x[rows] W^T for a bf16-table affine projection: the core row kernels (MLX's arithmetic).
++    pub fn project(x: Enc, w: wts.Linear, in: Ref, out: Ref, rows: usize) void {
++        const call = row.call(&x.m.kernels.rows, w, rows, false) catch unreachable;
++        x.e.setPipeline(call.pipeline);
++        x.bind(in, 0);
++        x.e.setBuffer(w.w, w.w_off, 1);
++        x.e.setBuffer(w.scales, w.s_off, 2);
++        x.e.setBuffer(w.biases, w.b_off, 3);
++        x.e.setValue(call.dims, 4);
++        x.bind(out, 5);
++        x.groups(.{ call.groups, 1, 1 }, .{ call.threads, 1, 1 });
++    }
++
++    /// out (bf16 [rows][hidden]) = RMS norm of `in` rows `stride` apart (FP32 or bf16) with gain `w`.
++    pub fn rms(x: Enc, f32_in: bool, in: Ref, stride: usize, w: wts.Tensor, out: Ref, rows: usize) void {
++        if (f32_in) x.pipe("ink_rms_f32") else x.pipe("ink_rms_bf16");
++        x.bind(in, 0);
++        x.bind(of(w), 1);
++        x.value(@as(u32, @intCast(stride)), 2);
++        x.value(x.m.config.text.eps, 3);
++        x.bind(out, 4);
++        x.groups(.{ rows, 1, 1 }, .{ 256, 1, 1 });
++    }
++
++    /// y = x W^T for a bf16 matrix [n, k] (nn.Linear), bf16 or FP32 outputs.
++    pub fn dense(x: Enc, f32_out: bool, w: wts.Tensor, in: Ref, out: Ref, rows: usize) void {
++        if (f32_out) x.pipe("ink_dense_bf16_f32") else x.pipe("ink_dense_bf16_bf16");
++        const n = w.shape[0];
++        x.bind(in, 0);
++        x.bind(of(w), 1);
++        x.value([2]u32{ @intCast(w.shape[1]), @intCast(n) }, 2);
++        x.bind(out, 3);
++        x.groups(.{ (n + 3) / 4, rows, 1 }, .{ 128, 1, 1 });
++    }
++
++    /// out[row][q] = the softmax mix over `nb` blocks of `blocks` (rows apart by the scratch) and the partial rows.
++    pub fn mix(x: Enc, blocks: Ref, nb: usize, f32_partial: bool, partial: Ref, pstride: usize, query: Ref, nq: usize, out: Ref) void {
++        if (f32_partial) x.pipe("ink_mix_f32") else x.pipe("ink_mix_bf16");
++        x.bind(blocks, 0);
++        x.bind(partial, 1);
++        x.bind(query, 2);
++        x.e.setBytes(std.mem.asBytes(&MixArgs{ .nb = @intCast(nb), .nq = @intCast(nq), .stride = @intCast(x.s.rows * g.hidden), .pstride = @intCast(pstride) }), 3);
++        x.bind(out, 4);
++        x.groups(.{ x.rows, 1, 1 }, .{ 256, 1, 1 });
++    }
++
++    /// dst = src over `n` bf16 values.
++    pub fn copy(x: Enc, src: Ref, dst: Ref, n: usize) void {
++        x.pipe("ink_copy");
++        x.bind(src, 0);
++        x.bind(dst, 1);
++        x.value(@as(u32, @intCast(n)), 2);
++        x.threads(.{ n, 1, 1 }, .{ 256, 1, 1 });
++    }
++
++    /// The message gate `gt` on h (FP32 rows `hs` apart) and message m (rows `ms` apart) into scratch gate_out.
++    pub fn gate(x: Enc, gt: wts.Gate, h: Ref, hs: usize, m: Ref, ms: usize) void {
++        const s = x.s;
++        x.pipe("ink_gate_in");
++        x.bind(h, 0);
++        x.bind(m, 1);
++        x.value([2]u32{ @intCast(hs), @intCast(ms) }, 2);
++        x.value(x.m.config.text.eps, 3);
++        x.bind(at(s.gate_in, 0), 4);
++        x.groups(.{ x.rows, 1, 1 }, .{ 256, 1, 1 });
++        x.dense(false, gt.down, at(s.gate_in, 0), at(s.gate_low, 0), x.rows);
++        x.pipe("ink_gate_out");
++        x.bind(at(s.gate_low, 0), 0);
++        x.bind(of(gt.forget), 1);
++        x.bind(of(gt.gain), 2);
++        x.bind(h, 3);
++        x.bind(m, 4);
++        x.value([2]u32{ @intCast(hs), @intCast(ms) }, 5);
++        x.bind(at(s.gate_out, 0), 6);
++        x.threads(.{ g.hidden, x.rows, 1 }, .{ 256, 1, 1 });
++    }
++
++    /// Experts' gate-up SwiGLU (`glu`, with `up`) or down over every pick: y[slot] FP32.
++    pub fn experts(x: Enc, glu: bool, w: wts.Experts, up: ?wts.Experts, in: Ref, out: Ref, slots: usize) void {
++        x.e.setPipeline(x.m.kernels.experts(glu, w.bits, w.bf16));
++        x.bind(in, 0);
++        x.bind(of(w.w), 1);
++        x.bind(of(w.s), 2);
++        x.bind(of(w.b), 3);
++        x.e.setBytes(std.mem.asBytes(&QmvArgs{ .k = @intCast(w.k), .n = @intCast(w.n), .repeat = if (glu) g.topk else 1, .indexed = 1 }), 4);
++        x.bind(out, 5);
++        x.bind(at(x.s.picks, 0), 6);
++        const u = up orelse w;
++        x.bind(of(u.w), 7);
++        x.bind(of(u.s), 8);
++        x.bind(of(u.b), 9);
++        x.groups(.{ w.n / 8, slots, 1 }, .{ 64, 1, 1 });
++    }
++};
+diff --git a/zig/src/families/inkling2/metal/forward.zig b/zig/src/families/inkling2/metal/forward.zig
+new file mode 100644
+index 0000000..6ca7341
+--- /dev/null
++++ b/zig/src/families/inkling2/metal/forward.zig
+@@ -0,0 +1,108 @@
++//! One command buffer a call: the embedding, 48 layer visits over one stream's slots, the final mix, norm and head.
++const std = @import("std");
++const mtl = @import("metal");
++const g = @import("geometry.zig");
++const st = @import("state.zig");
++const layer = @import("layer.zig");
++const enc = @import("encode.zig");
++const Model = @import("model.zig").Model;
++const at = enc.at;
++const of = enc.of;
++
++/// `last`: the last row's logits; `all`: every row's logits and greedy pick (scratch best); `none`: no head.
++pub const Head = enum { last, all, none };
++
++pub const Options = struct {
++    head: Head = .last,
++    /// Each visit's input rows, [visits][rows][hidden] bf16, and the final normed rows after them (validation).
++    capture: ?mtl.Buffer = null,
++    /// Visits to run (debugging: the scratch then holds the last one's rows); the head runs after all 48 only.
++    visits: usize = g.visits,
++};
++
++/// GPU seconds of every call so far.
++pub var gpu_seconds: f64 = 0;
++
++/// `ids` at positions cache.len.. through the model; the cache's slots take their keys, values and conv states.
++pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, o: Options) !void {
++    const rows = ids.len;
++    if (rows == 0 or rows > s.rows or (o.head == .all and rows > s.logit_rows)) return error.InklingRowsExceeded;
++    if (cache.len + rows > cache.capacity) return error.InklingContextFull;
++    for (ids) |id| if (id >= g.vocab) return error.InvalidInklingToken;
++    @memcpy(s.ids.slice(u32, rows), ids);
++    const pool = mtl.objc.Pool.push();
++    defer pool.pop();
++    const cb = m.queue.commandBuffer();
++    const e = cb.compute(.serial);
++    const x = enc.Enc{ .e = e, .m = m, .s = s, .rows = rows };
++    encode(x, cache, o);
++    e.end();
++    cb.commit();
++    cb.wait();
++    gpu_seconds += cb.gpuSeconds();
++    if (cb.failure()) |msg| {
++        std.debug.print("Inkling 2 forward: {s}\n", .{msg});
++        return error.GpuFailed;
++    }
++    cache.len += rows;
++    if (o.head != .none and o.visits == g.visits) {
++        const row = if (o.head == .all) rows - 1 else 0;
++        @memcpy(cache.logits.contents()[0 .. g.vocab * 4], (s.logits.contents() + row * g.vocab * 4)[0 .. g.vocab * 4]);
++    }
++}
++
++fn encode(x: enc.Enc, cache: *const st.Cache, o: Options) void {
++    const m = x.m;
++    const s = x.s;
++    const d = g.hidden;
++    const rows = x.rows;
++    const w = &m.weights;
++    const plane = s.rows * d * 2;
++    x.pipe("ink_embed_norm");
++    x.bind(at(s.ids, 0), 0);
++    x.e.setBuffer(w.embed.w, w.embed.w_off, 1);
++    x.e.setBuffer(w.embed.scales, w.embed.s_off, 2);
++    x.e.setBuffer(w.embed.biases, w.embed.b_off, 3);
++    x.bind(of(w.embed_norm), 4);
++    x.value(m.config.text.eps, 5);
++    x.bind(at(s.x, 0), 6);
++    x.groups(.{ rows, 1, 1 }, .{ 256, 1, 1 });
++    const loop = m.config.loop.?;
++    var blocks: usize = 0;
++    for (m.plan[0..o.visits], 0..) |v, i| {
++        if (v.layer == loop.start and v.pass > 0) {
++            // Restart from the pre-loop state; the messages read the last pass's layer-12 block and its output.
++            x.copy(at(s.blocks, 2 * plane), at(s.states, 0), rows * d);
++            x.copy(at(s.x, 0), at(s.states, plane), rows * d);
++            x.copy(at(s.blocks, plane), at(s.x, 0), rows * d);
++            blocks = 1;
++        }
++        if (o.capture) |cap| x.copy(at(s.x, 0), at(cap, i * rows * d * 2), rows * d);
++        blocks = layer.run(x, &w.layers[v.layer], .{ .index = i, .layer = v.layer, .pass = v.pass, .slot = v.slot, .blocks = blocks }, cache);
++    }
++    if (o.visits < g.visits) return;
++    x.mix(at(s.blocks, 0), blocks, false, at(s.x, 0), d, of(w.final_query), 1, at(s.mix, 0));
++    x.rms(true, at(s.mix, 0), d, w.norm, at(s.xm, 0), rows);
++    if (o.capture) |cap| x.copy(at(s.xm, 0), at(cap, g.visits * rows * d * 2), rows * d);
++    if (o.head == .none) return;
++    const head_rows: usize = if (o.head == .all) rows else 1;
++    const first: usize = if (o.head == .all) 0 else rows - 1;
++    x.e.setPipeline(m.kernels.head(w.head.bits));
++    x.bind(at(s.xm, first * d * 2), 0);
++    x.e.setBuffer(w.head.w, w.head.w_off, 1);
++    x.e.setBuffer(w.head.scales, w.head.s_off, 2);
++    x.e.setBuffer(w.head.biases, w.head.b_off, 3);
++    x.e.setBytes(std.mem.asBytes(&enc.QmvArgs{ .k = d, .n = g.vocab, .repeat = 1, .indexed = 0 }), 4);
++    x.bind(at(s.logits, 0), 5);
++    x.bind(at(s.ids, 0), 6);
++    x.e.setBuffer(w.head.w, w.head.w_off, 7);
++    x.e.setBuffer(w.head.scales, w.head.s_off, 8);
++    x.e.setBuffer(w.head.biases, w.head.b_off, 9);
++    x.groups(.{ g.vocab / 8, head_rows, 1 }, .{ 64, 1, 1 });
++    x.pipe("ink_head_pick");
++    x.bind(at(s.logits, 0), 0);
++    x.value([3]u32{ g.vocab, m.config.text.unpadded_vocab, 0 }, 1);
++    x.value(m.config.text.logit_cap, 2);
++    x.bind(at(s.best, 0), 3);
++    x.groups(.{ head_rows, 1, 1 }, .{ 1024, 1, 1 });
++}
+diff --git a/zig/src/families/inkling2/metal/geometry.zig b/zig/src/families/inkling2/metal/geometry.zig
+new file mode 100644
+index 0000000..8e50ce5
+--- /dev/null
++++ b/zig/src/families/inkling2/metal/geometry.zig
+@@ -0,0 +1,46 @@
++//! Inkling 2 Mini's pinned geometry on Metal (the kernels' constants); the loader refuses a config that differs.
++const std = @import("std");
++const config = @import("../config.zig");
++
++pub const hidden = 2304;
++pub const q_heads = 24;
++pub const kv_heads = 8;
++pub const head_dim = 128;
++pub const d_rel = 16;
++/// The sliding window and both kinds' relative-bias extent.
++pub const extent = 1024;
++pub const experts = 128;
++pub const topk = 8;
++pub const inter = 1152;
++pub const vocab = 201024;
++pub const layers = 24;
++pub const visits = 48;
++pub const block = 6;
++pub const rank = 64;
++pub const group = 64;
++/// Each visit's conv states: k and v (kv width), after attention and after the MLP (hidden), three rows each, FP32.
++pub const conv_floats = 3 * (2 * kv_heads * head_dim + 2 * hidden);
++
++pub const Error = error{UnsupportedInklingGeometry};
++
++/// The config's shape is the one the kernels are written for: Inkling 2 Mini, text only.
++pub fn check(c: *const config.Config) Error!void {
++    const t = &c.text;
++    const l = c.loop orelse return error.UnsupportedInklingGeometry;
++    const same = t.hidden == hidden and t.layers == layers and t.vocab == vocab and t.global.q == q_heads and
++        t.global.kv == kv_heads and t.global.dim == head_dim and t.local.q == q_heads and t.local.kv == kv_heads and
++        t.local.dim == head_dim and t.d_rel == d_rel and t.window == extent and t.rel_extent == extent and
++        t.experts == experts and t.topk == topk and t.expert_inter == inter and t.block == block and
++        l.start == 6 and l.end == 18 and l.passes == 3 and l.rank == rank and c.format == .mlx_affine;
++    if (!same) return error.UnsupportedInklingGeometry;
++}
++
++test "Mini's MLX config is the pinned geometry; Small is not" {
++    const t = std.testing;
++    var why: config.Why = .{};
++    const mini = try config.parse(t.allocator, @embedFile("../fixtures/mini_mlx_config.json"), &why);
++    try check(&mini);
++    try t.expectEqual(@as(u32, visits), mini.visits());
++    const small = try config.parse(t.allocator, @embedFile("../fixtures/config.json"), &why);
++    try t.expectError(error.UnsupportedInklingGeometry, check(&small));
++}
+diff --git a/zig/src/families/inkling2/metal/kernels.zig b/zig/src/families/inkling2/metal/kernels.zig
+new file mode 100644
+index 0000000..83ad773
+--- /dev/null
++++ b/zig/src/families/inkling2/metal/kernels.zig
+@@ -0,0 +1,87 @@
++//! Inkling 2 Mini's Metal pipelines: the family's kernels (inkling2*.metal) and the core row projections.
++const std = @import("std");
++const mtl = @import("metal");
++const sources = @import("kernel_sources");
++const row = @import("../../../core/row_projection.zig");
++
++const names = [_][:0]const u8{
++    "ink_embed_norm",
++    "ink_rms_f32",
++    "ink_rms_bf16",
++    "ink_mix_bf16",
++    "ink_mix_f32",
++    "ink_gate_in",
++    "ink_gate_out",
++    "ink_dense_bf16_bf16",
++    "ink_dense_bf16_f32",
++    "ink_conv_kv",
++    "ink_conv_attn",
++    "ink_conv_mlp",
++    "ink_conv_mlp_bf16",
++    "ink_conv_dyn",
++    "ink_route",
++    "ink_combine",
++    "ink_copy",
++    "ink_head_pick",
++    "ink_prep",
++    "ink_attn",
++    "ink_glu_q3",
++    "ink_glu_q4",
++    "ink_down_q3",
++    "ink_down_q4",
++    "ink_head_q4",
++    "ink_head_q6",
++    "ink_head_q8",
++    "ink_glu_q3_bf16",
++    "ink_glu_q4_bf16",
++    "ink_down_q3_bf16",
++    "ink_down_q4_bf16",
++};
++
++pub const Kernels = struct {
++    pipelines: [names.len]mtl.Pipeline,
++    rows: row.Pipelines,
++
++    pub fn get(self: *const Kernels, comptime key: []const u8) mtl.Pipeline {
++        inline for (names, 0..) |n, i| if (comptime std.mem.eql(u8, n, key)) return self.pipelines[i];
++        @compileError("no Inkling 2 kernel " ++ key);
++    }
++
++    /// The experts' gate-up SwiGLU or down kernel at a width of 3 or 4 bits, for FP32 or bf16 tables.
++    pub fn experts(self: *const Kernels, glu: bool, bits: u8, bf16: bool) mtl.Pipeline {
++        if (bf16) {
++            if (glu) return if (bits == 3) self.get("ink_glu_q3_bf16") else self.get("ink_glu_q4_bf16");
++            return if (bits == 3) self.get("ink_down_q3_bf16") else self.get("ink_down_q4_bf16");
++        }
++        if (glu) return if (bits == 3) self.get("ink_glu_q3") else self.get("ink_glu_q4");
++        return if (bits == 3) self.get("ink_down_q3") else self.get("ink_down_q4");
++    }
++
++    /// The head's FP32-logit kernel at its width (4, 6 or 8 bits).
++    pub fn head(self: *const Kernels, bits: u8) mtl.Pipeline {
++        return switch (bits) {
++            4 => self.get("ink_head_q4"),
++            6 => self.get("ink_head_q6"),
++            else => self.get("ink_head_q8"),
++        };
++    }
++
++    pub fn deinit(self: *Kernels) void {
++        for (self.pipelines) |p| p.deinit();
++        self.rows.deinit();
++    }
++};
++
++pub fn load(device: mtl.Device) !Kernels {
++    var out: Kernels = undefined;
++    const lib = try mtl.Library.fromSource(device, sources.inkling2, mtl.CompileOptions.mlx());
++    defer lib.deinit();
++    var loaded: usize = 0;
++    errdefer for (out.pipelines[0..loaded]) |p| p.deinit();
++    for (names, 0..) |name, i| {
++        out.pipelines[i] = try mtl.Pipeline.init(device, lib, name, false);
++        loaded += 1;
++    }
++    out.rows = try row.Pipelines.load(device);
++    return out;
++}
+diff --git a/zig/src/families/inkling2/metal/layer.zig b/zig/src/families/inkling2/metal/layer.zig
+new file mode 100644
+index 0000000..4a98835
+--- /dev/null
++++ b/zig/src/families/inkling2/metal/layer.zig
+@@ -0,0 +1,176 @@
++//! One layer visit: the attention input mix (and pass 2-3 message gates), attention, its conv, the MLP input, experts.
++const std = @import("std");
++const g = @import("geometry.zig");
++const st = @import("state.zig");
++const wts = @import("weights.zig");
++const enc = @import("encode.zig");
++const Enc = enc.Enc;
++const Ref = enc.Ref;
++const at = enc.at;
++const of = enc.of;
++
++/// The prepared rows' constants (PrepArgs in inkling2_attn.metal) and the attention's (AttnArgs).
++const PrepArgs = extern struct { pos0: u32, global: u32, qk_clip: f32, rel_clip: f32, eps: f32, log_floor: f32, log_alpha: f32, pad: u32 = 0 };
++const AttnArgs = extern struct { pos0: u32, sliding: u32, scale: f32, pad: u32 = 0 };
++
++/// Where a visit runs: its layer's weights, its loop pass, its cache slot, and how many blocks are finished.
++pub const Visit = struct { index: usize, layer: usize, pass: usize, slot: usize, blocks: usize };
++
++/// The visit's q, k and v input rows: mix parts, gated in passes 2 and 3, each RMS normed into xq, xk, xv.
++fn inputs(x: Enc, w: *const wts.Layer, v: Visit) void {
++    const s = x.s;
++    const d = g.hidden;
++    const rows = x.rows;
++    const nq: usize = if (w.attn_query == null) 0 else if (w.global) 3 else 1;
++    if (nq > 0) x.mix(at(s.blocks, 0), v.blocks, false, at(s.x, 0), d, of(w.attn_query.?), nq, at(s.mix, 0));
++    const looped = v.pass > 0;
++    if (looped) {
++        const query = at(x.m.weights.message_query.buffer, x.m.weights.message_query.offset + (v.layer - 6) * 4 * d * 4);
++        x.mix(at(s.states, 0), 1, false, at(s.states, s.rows * d * 2), d, query, 4, at(s.msg, 0));
++    }
++    const outs = [3]Ref{ at(s.xq, 0), at(s.xk, 0), at(s.xv, 0) };
++    // A sliding layer outside the loop normalizes one input for all three projections.
++    const parts: usize = if (!w.global and !looped) 1 else 3;
++    for (0..parts) |j| {
++        if (nq == 0) {
++            x.rms(false, at(s.x, 0), d, w.norms[j], outs[j], rows);
++            continue;
++        }
++        const src = at(s.mix, @min(j, nq - 1) * d * 4);
++        if (looped) {
++            x.gate(w.gates.?[j], src, nq * d, at(s.msg, j * d * 4), 4 * d);
++            x.rms(true, at(s.gate_out, 0), d, w.norms[j], outs[j], rows);
++        } else x.rms(true, src, nq * d, w.norms[j], outs[j], rows);
++    }
++}
++
++fn kvConv(x: Enc, c: wts.KvConv, in: Ref, xin: Ref, dyn: Ref, state: Ref, out: Ref) void {
++    const kv = g.kv_heads * g.head_dim;
++    switch (c) {
++        .static => |weight| {
++            x.pipe("ink_conv_kv");
++            x.bind(in, 0);
++            x.bind(state, 1);
++            x.bind(of(weight), 2);
++            x.value([4]u32{ kv, @intCast(x.rows), 0, 0 }, 3);
++            x.bind(out, 4);
++            x.bind(in, 5);
++            x.bind(in, 6);
++            x.threads(.{ kv, 1, 1 }, .{ 256, 1, 1 });
++        },
++        .dynamic => |d| {
++            x.dense(false, d.proj, xin, dyn, x.rows);
++            x.pipe("ink_conv_dyn");
++            x.bind(in, 0);
++            x.bind(state, 1);
++            x.bind(of(d.taps), 2);
++            x.bind(dyn, 3);
++            x.value(@as(u32, @intCast(x.rows)), 4);
++            x.bind(out, 5);
++            x.threads(.{ kv, 1, 1 }, .{ 256, 1, 1 });
++        },
++    }
++}
++
++fn attention(x: Enc, w: *const wts.Layer, v: Visit, cache: *const st.Cache) void {
++    const s = x.s;
++    const t = &x.m.config.text;
++    const rows = x.rows;
++    const conv = st.Cache.convOffset(v.slot);
++    const kv = g.kv_heads * g.head_dim;
++    x.project(w.q, at(s.xq, 0), at(s.q, 0), rows);
++    x.project(w.r, at(s.xq, 0), at(s.r, 0), rows);
++    x.project(w.gate, at(s.xq, 0), at(s.gate, 0), rows);
++    x.dense(false, w.sink, at(s.xq, 0), at(s.sink, 0), rows);
++    // A sliding layer outside the loop feeds one normed input to all three projections.
++    const shared = !w.global and v.pass == 0;
++    const xk = if (shared) at(s.xq, 0) else at(s.xk, 0);
++    const xv = if (shared) at(s.xq, 0) else at(s.xv, 0);
++    x.project(w.k, xk, at(s.k, 0), rows);
++    x.project(w.v, xv, at(s.v, 0), rows);
++    kvConv(x, w.k_conv, at(s.k, 0), xk, at(s.dk, 0), at(cache.conv, conv), at(s.kc, 0));
++    kvConv(x, w.v_conv, at(s.v, 0), xv, at(s.dv, 0), at(cache.conv, conv + 3 * kv * 4), at(s.vc, 0));
++    const pos0: u32 = @intCast(cache.len);
++    x.pipe("ink_prep");
++    for ([_]Ref{ at(s.q, 0), at(s.r, 0), at(s.kc, 0), at(s.vc, 0), of(w.q_scale), of(w.rel_scale) }, 0..) |r, i| x.bind(r, i);
++    const prep = PrepArgs{ .pos0 = pos0, .global = @intFromBool(w.global), .qk_clip = t.qk_clip, .rel_clip = t.rel_clip, .eps = t.eps, .log_floor = @floatFromInt(t.log_floor), .log_alpha = t.log_alpha };
++    x.e.setBytes(std.mem.asBytes(&prep), 6);
++    x.bind(at(s.qp, 0), 7);
++    x.bind(at(s.rp, 0), 8);
++    x.bind(at(cache.kv, cache.keysOffset(v.slot)), 9);
++    x.bind(at(cache.kv, cache.valuesOffset(v.slot)), 10);
++    x.groups(.{ 2 * g.q_heads + 2 * g.kv_heads, rows, 1 }, .{ 32, 1, 1 });
++    x.pipe("ink_attn");
++    for ([_]Ref{ at(s.qp, 0), at(s.rp, 0), at(s.sink, 0), at(s.gate, 0), at(cache.kv, cache.keysOffset(v.slot)), at(cache.kv, cache.valuesOffset(v.slot)), of(w.rel_proj) }, 0..) |r, i| x.bind(r, i);
++    const args = AttnArgs{ .pos0 = pos0, .sliding = @intFromBool(!w.global), .scale = 1.0 / @sqrt(@as(f32, g.head_dim)) };
++    x.e.setBytes(std.mem.asBytes(&args), 7);
++    x.bind(at(s.attn, 0), 8);
++    x.groups(.{ g.q_heads, rows, 1 }, .{ 256, 1, 1 });
++    x.project(w.o, at(s.attn, 0), at(s.o, 0), rows);
++}
++
++/// The visit, x in place: a boundary layer's input joins the finished blocks after attention. Returns the block count.
++pub fn run(x: Enc, w: *const wts.Layer, v: Visit, cache: *const st.Cache) usize {
++    const s = x.s;
++    const d = g.hidden;
++    const rows = x.rows;
++    const conv = st.Cache.convOffset(v.slot);
++    const kv = g.kv_heads * g.head_dim;
++    inputs(x, w, v);
++    attention(x, w, v, cache);
++    x.pipe("ink_conv_attn");
++    x.bind(at(s.o, 0), 0);
++    x.bind(at(cache.conv, conv + 6 * kv * 4), 1);
++    x.bind(of(w.attn_conv), 2);
++    x.value([4]u32{ d, @intCast(rows), @intFromBool(!w.boundary), 0 }, 3);
++    x.bind(at(s.res, 0), 4);
++    x.bind(at(s.x, 0), 5);
++    x.bind(at(s.res, 0), 6);
++    x.threads(.{ d, 1, 1 }, .{ 256, 1, 1 });
++    var blocks = v.blocks;
++    if (w.boundary) {
++        x.copy(at(s.x, 0), at(s.blocks, blocks * s.rows * d * 2), rows * d);
++        blocks += 1;
++    }
++    x.mix(at(s.blocks, 0), blocks, true, at(s.res, 0), d, of(w.mlp_query), 1, at(s.mix, 0));
++    var hidden = at(s.mix, 0);
++    if (v.pass > 0) {
++        x.gate(w.gates.?[3], hidden, d, at(s.msg, 3 * d * 4), 4 * d);
++        hidden = at(s.gate_out, 0);
++    }
++    x.rms(true, hidden, d, w.post_norm, at(s.xm, 0), rows);
++    moe(x, w);
++    if (w.ex_down.bf16) x.pipe("ink_conv_mlp_bf16") else x.pipe("ink_conv_mlp");
++    x.bind(at(s.moe, 0), 0);
++    x.bind(at(cache.conv, conv + (6 * kv + 3 * d) * 4), 1);
++    x.bind(of(w.mlp_conv), 2);
++    x.value([4]u32{ d, @intCast(rows), 0, 0 }, 3);
++    x.bind(at(s.x, 0), 4);
++    x.bind(at(s.x, 0), 5);
++    x.bind(at(s.res, 0), 6);
++    x.threads(.{ d, 1, 1 }, .{ 256, 1, 1 });
++    return blocks;
++}
++
++/// Router, top-8 picks, the experts' SwiGLU and down projections (FP32), and their weighted sum into scratch moe.
++fn moe(x: Enc, w: *const wts.Layer) void {
++    const s = x.s;
++    const rows = x.rows;
++    const slots = rows * g.topk;
++    x.dense(true, w.router, at(s.xm, 0), at(s.route, 0), rows);
++    x.pipe("ink_route");
++    x.bind(at(s.route, 0), 0);
++    x.bind(of(w.router_bias), 1);
++    x.value(x.m.config.text.route_scale, 2);
++    x.bind(at(s.picks, 0), 3);
++    x.bind(at(s.weights, 0), 4);
++    x.groups(.{ rows, 1, 1 }, .{ g.experts, 1, 1 });
++    x.experts(true, w.ex_gate, w.ex_up, at(s.xm, 0), at(s.act, 0), slots);
++    x.experts(false, w.ex_down, null, at(s.act, 0), at(s.ey, 0), slots);
++    x.pipe("ink_combine");
++    x.bind(at(s.ey, 0), 0);
++    x.bind(at(s.weights, 0), 1);
++    x.bind(at(s.moe, 0), 2);
++    x.value(@as(u32, @intFromBool(w.ex_down.bf16)), 3);
++    x.threads(.{ g.hidden, rows, 1 }, .{ 256, 1, 1 });
++}
+diff --git a/zig/src/families/inkling2/metal/metal.zig b/zig/src/families/inkling2/metal/metal.zig
+new file mode 100644
+index 0000000..4f2588a
+--- /dev/null
++++ b/zig/src/families/inkling2/metal/metal.zig
+@@ -0,0 +1,15 @@
++//! Native Metal Inkling 2 Mini (inkling2_loop): MLX affine weights, 48 layer visits a token, text only.
++pub const geometry = @import("geometry.zig");
++pub const weights = @import("weights.zig");
++pub const kernels = @import("kernels.zig");
++pub const Model = @import("model.zig").Model;
++pub const state = @import("state.zig");
++pub const forward = @import("forward.zig");
++pub const config = @import("../config.zig");
++pub const loop = @import("../loop.zig");
++
++test {
++    _ = geometry;
++    _ = state;
++    _ = loop;
++}
+diff --git a/zig/src/families/inkling2/metal/model.zig b/zig/src/families/inkling2/metal/model.zig
+new file mode 100644
+index 0000000..5fb07a3
+--- /dev/null
++++ b/zig/src/families/inkling2/metal/model.zig
+@@ -0,0 +1,77 @@
++//! A native Inkling 2 Mini model on Metal: the validated config, the checkpoint's views and the pipelines.
++const std = @import("std");
++const mtl = @import("metal");
++const config = @import("../config.zig");
++const loop = @import("../loop.zig");
++const ckpt = @import("../../../core/checkpoint_metal.zig");
++const shards = @import("../../../core/checkpoint.zig");
++const g = @import("geometry.zig");
++const weights = @import("weights.zig");
++const kernels = @import("kernels.zig");
++
++pub const Model = struct {
++    gpa: std.mem.Allocator,
++    device: mtl.Device,
++    queue: mtl.Queue,
++    config: config.Config,
++    /// Every visit in schedule order (layer, pass, cache slot).
++    plan: [g.visits]loop.Visit,
++    checkpoint: ckpt.Checkpoint,
++    weights: weights.Weights,
++    kernels: kernels.Kernels,
++    resident: ?mtl.ResidencySet = null,
++
++    pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !*Model {
++        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
++        const path = try std.fmt.bufPrint(&path_buf, "{s}/config.json", .{dir});
++        const json = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
++        defer gpa.free(json);
++        var why: config.Why = .{};
++        const c = config.parse(gpa, json, &why) catch |e| {
++            std.log.err("Inkling 2: {s}", .{why.text()});
++            return e;
++        };
++        g.check(&c) catch |e| {
++            std.log.err("Inkling 2 on Metal serves Inkling 2 Mini's MLX affine checkpoint only (hidden 2304, a 6-17 loop)", .{});
++            return e;
++        };
++        const m = try gpa.create(Model);
++        errdefer gpa.destroy(m);
++        m.gpa = gpa;
++        m.config = c;
++        _ = try loop.plan(g.layers, c.loop.?, &m.plan);
++        m.device = try mtl.Device.init();
++        errdefer m.device.deinit();
++        m.queue = try m.device.queue();
++        errdefer m.queue.deinit();
++        m.checkpoint = ckpt.Checkpoint.init(gpa);
++        errdefer m.checkpoint.deinit();
++        const files = try shards.shardFiles(gpa, io, dir);
++        defer shards.freeShardFiles(gpa, files);
++        for (files) |file| try m.checkpoint.addFile(m.device, file, "");
++        m.weights = try weights.load(&m.checkpoint);
++        m.kernels = try kernels.load(m.device);
++        errdefer m.kernels.deinit();
++        m.resident = null;
++        if (m.device.residencySet(m.checkpoint.shards.items.len)) |set| {
++            for (m.checkpoint.shards.items) |shard| set.add(shard.buffer);
++            set.commit();
++            set.requestResidency();
++            m.queue.addResidencySet(set);
++            m.resident = set;
++        } else |_| {}
++        return m;
++    }
++
++    pub fn deinit(m: *Model) void {
++        if (m.resident) |set| {
++            m.queue.removeResidencySet(set);
++            set.deinit();
++        }
++        m.kernels.deinit();
++        m.checkpoint.deinit();
++        m.queue.deinit();
++        m.device.deinit();
++        m.gpa.destroy(m);
++    }
++};
+diff --git a/zig/src/families/inkling2/metal/state.zig b/zig/src/families/inkling2/metal/state.zig
+new file mode 100644
+index 0000000..f106642
+--- /dev/null
++++ b/zig/src/families/inkling2/metal/state.zig
+@@ -0,0 +1,190 @@
++//! A stream's 48 visit slots (keys, values and four conv states each) and a forward's scratch rows.
++const std = @import("std");
++const mtl = @import("metal");
++const g = @import("geometry.zig");
++
++const opts = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
++
++/// Owned Metal buffers, joined to a residency set when one is followed.
++pub const Storage = struct {
++    residency: ?mtl.ResidencySet.Follow = null,
++    gpa: std.mem.Allocator,
++    device: mtl.Device,
++    buffers: std.ArrayList(mtl.Buffer) = .empty,
++
++    pub fn alloc(self: *Storage, bytes: usize) !mtl.Buffer {
++        const b = try self.device.buffer(@max(bytes, 16), opts);
++        errdefer b.deinit();
++        try self.buffers.append(self.gpa, b);
++        if (self.residency) |f| f.join(f.ctx, b);
++        return b;
++    }
++
++    pub fn setResident(self: *Storage, hook: ?mtl.ResidencySet.Follow) void {
++        for (self.buffers.items) |b| {
++            if (self.residency) |f| f.leave(f.ctx, b);
++            if (hook) |f| f.join(f.ctx, b);
++        }
++        self.residency = hook;
++    }
++
++    pub fn deinit(self: *Storage) void {
++        self.setResident(null);
++        for (self.buffers.items) |b| b.deinit();
++        self.buffers.deinit(self.gpa);
++    }
++};
++
++/// Bytes of one position's keys (or values) in one slot: 8 heads of 128, bf16.
++pub const row_kv_bytes = g.kv_heads * g.head_dim * 2;
++
++/// Each visit slot's keys and values, `capacity` positions (every position kept), and its conv states.
++pub const Cache = struct {
++    memory: Storage,
++    capacity: usize,
++    len: usize = 0,
++    /// [slot][keys, values][capacity][8][128] bf16.
++    kv: mtl.Buffer,
++    /// [slot][conv_floats] FP32: k, v (3 rows of 1024), after attention, after the MLP (3 rows of 2304).
++    conv: mtl.Buffer,
++    /// The last forward's last row of logits (FP32, softcapped).
++    logits: mtl.Buffer,
++
++    pub fn init(gpa: std.mem.Allocator, device: mtl.Device, capacity: usize) !Cache {
++        var out: Cache = .{ .memory = .{ .gpa = gpa, .device = device }, .capacity = capacity, .kv = undefined, .conv = undefined, .logits = undefined };
++        errdefer out.memory.deinit();
++        out.kv = try out.memory.alloc(bytesKv(capacity));
++        out.conv = try out.memory.alloc(g.visits * g.conv_floats * 4);
++        out.logits = try out.memory.alloc(g.vocab * 4);
++        out.reset();
++        return out;
++    }
++
++    /// An empty history: no positions, zero conv states.
++    pub fn reset(self: *Cache) void {
++        self.len = 0;
++        @memset(self.conv.contents()[0 .. g.visits * g.conv_floats * 4], 0);
++    }
++
++    pub fn keysOffset(self: *const Cache, slot: usize) usize {
++        return slot * 2 * self.capacity * row_kv_bytes;
++    }
++
++    pub fn valuesOffset(self: *const Cache, slot: usize) usize {
++        return self.keysOffset(slot) + self.capacity * row_kv_bytes;
++    }
++
++    pub fn convOffset(slot: usize) usize {
++        return slot * g.conv_floats * 4;
++    }
++
++    pub fn deinit(self: *Cache) void {
++        self.memory.deinit();
++    }
++};
++
++pub fn bytesKv(capacity: usize) usize {
++    return g.visits * 2 * capacity * row_kv_bytes;
++}
++
++/// Bytes a stream's cache takes at `capacity` positions.
++pub fn cacheBytes(capacity: usize) u64 {
++    return bytesKv(capacity) + g.visits * g.conv_floats * 4 + g.vocab * 4;
++}
++
++/// A forward's working rows, `rows` at most a call.
++pub const Scratch = struct {
++    memory: Storage,
++    rows: usize,
++    ids: mtl.Buffer,
++    /// The running hidden row (bf16), the four finished blocks (bf16, `rows` apart) and the message states (two).
++    x: mtl.Buffer,
++    blocks: mtl.Buffer,
++    states: mtl.Buffer,
++    /// Mix outputs [rows][up to 4][hidden] and messages [rows][4][hidden], FP32.
++    mix: mtl.Buffer,
++    msg: mtl.Buffer,
++    /// A gate's input [rows][2 hidden] bf16, its rank-64 row, its output [rows][hidden] FP32.
++    gate_in: mtl.Buffer,
++    gate_low: mtl.Buffer,
++    gate_out: mtl.Buffer,
++    /// Normed q, k and v inputs (bf16).
++    xq: mtl.Buffer,
++    xk: mtl.Buffer,
++    xv: mtl.Buffer,
++    q: mtl.Buffer,
++    k: mtl.Buffer,
++    v: mtl.Buffer,
++    r: mtl.Buffer,
++    gate: mtl.Buffer,
++    sink: mtl.Buffer,
++    dk: mtl.Buffer,
++    dv: mtl.Buffer,
++    kc: mtl.Buffer,
++    vc: mtl.Buffer,
++    qp: mtl.Buffer,
++    rp: mtl.Buffer,
++    attn: mtl.Buffer,
++    o: mtl.Buffer,
++    res: mtl.Buffer,
++    xm: mtl.Buffer,
++    route: mtl.Buffer,
++    picks: mtl.Buffer,
++    weights: mtl.Buffer,
++    act: mtl.Buffer,
++    ey: mtl.Buffer,
++    moe: mtl.Buffer,
++    logits: mtl.Buffer,
++    best: mtl.Buffer,
++    /// Logit rows a call can return (every row up to this many).
++    logit_rows: usize,
++
++    pub fn init(gpa: std.mem.Allocator, device: mtl.Device, rows: usize, logit_rows: usize) !Scratch {
++        var s: Scratch = undefined;
++        s.memory = .{ .gpa = gpa, .device = device };
++        errdefer s.memory.deinit();
++        s.rows = rows;
++        s.logit_rows = @max(1, @min(rows, logit_rows));
++        const m = &s.memory;
++        const d = g.hidden;
++        const qd = g.q_heads * g.head_dim;
++        const kv = g.kv_heads * g.head_dim;
++        const slots = rows * g.topk;
++        s.ids = try m.alloc(rows * 4);
++        s.x = try m.alloc(rows * d * 2);
++        s.blocks = try m.alloc(4 * rows * d * 2);
++        s.states = try m.alloc(2 * rows * d * 2);
++        s.mix = try m.alloc(rows * 4 * d * 4);
++        s.msg = try m.alloc(rows * 4 * d * 4);
++        s.gate_in = try m.alloc(rows * 2 * d * 2);
++        s.gate_low = try m.alloc(rows * g.rank * 2);
++        s.gate_out = try m.alloc(rows * d * 4);
++        inline for (.{ "xq", "xk", "xv", "o", "xm" }) |name| @field(s, name) = try m.alloc(rows * d * 2);
++        inline for (.{ "q", "gate", "qp", "attn" }) |name| @field(s, name) = try m.alloc(rows * qd * 2);
++        inline for (.{ "k", "v", "kc", "vc" }) |name| @field(s, name) = try m.alloc(rows * kv * 2);
++        s.r = try m.alloc(rows * g.q_heads * g.d_rel * 2);
++        s.rp = try m.alloc(rows * g.q_heads * g.d_rel * 2);
++        s.sink = try m.alloc(rows * g.q_heads * 2);
++        s.dk = try m.alloc(rows * g.kv_heads * 4 * 2);
++        s.dv = try m.alloc(rows * g.kv_heads * 4 * 2);
++        s.res = try m.alloc(rows * d * 4);
++        s.route = try m.alloc(rows * g.experts * 4);
++        s.picks = try m.alloc(slots * 4);
++        s.weights = try m.alloc(slots * 4);
++        s.act = try m.alloc(slots * g.inter * 4);
++        s.ey = try m.alloc(slots * d * 4);
++        s.moe = try m.alloc(rows * d * 4);
++        s.logits = try m.alloc(s.logit_rows * g.vocab * 4);
++        s.best = try m.alloc(s.logit_rows * 4);
++        return s;
++    }
++
++    pub fn deinit(self: *Scratch) void {
++        self.memory.deinit();
++    }
++};
++
++test "a stream's cache: 48 slots of keys and values a position, conv states and one logit row" {
++    try std.testing.expectEqual(@as(u64, 48 * 2 * 2048), cacheBytes(1) - cacheBytes(0));
++    try std.testing.expectEqual(@as(usize, 20736), g.conv_floats);
++}
+diff --git a/zig/src/families/inkling2/metal/weights.zig b/zig/src/families/inkling2/metal/weights.zig
+new file mode 100644
+index 0000000..68f96e0
+--- /dev/null
++++ b/zig/src/families/inkling2/metal/weights.zig
+@@ -0,0 +1,194 @@
++//! Views into the MLX affine checkpoint's buffers, every tensor's dtype and shape checked: no copies.
++const std = @import("std");
++const ck = @import("../../../core/checkpoint_metal.zig");
++const row = @import("../../../core/row_projection.zig");
++const mlx_affine = @import("../../../core/quant/mlx_affine.zig");
++const g = @import("geometry.zig");
++
++pub const Tensor = ck.Tensor;
++/// A bf16-table affine projection, as the core row kernels read it.
++pub const Linear = row.Weights;
++
++/// Routed experts [experts, n, k]: `bits`-wide codes, FP32 or (`bf16`) bf16 scales and biases as the checkpoint stores.
++pub const Experts = struct { w: Tensor, s: Tensor, b: Tensor, bits: u8, n: usize, k: usize, bf16: bool };
++
++/// A loop layer's message gate: down [rank, 2 * hidden], forget and gain [hidden, rank], all bf16.
++pub const Gate = struct { down: Tensor, forget: Tensor, gain: Tensor };
++
++/// A sliding layer's static k or v conv, or a global layer's static taps and their input-dependent projection.
++pub const KvConv = union(enum) { static: Tensor, dynamic: struct { taps: Tensor, proj: Tensor } };
++
++pub const Layer = struct {
++    global: bool,
++    boundary: bool,
++    /// The attention input's learned queries [nq, hidden] FP32 (none on layer 0), the MLP input's [hidden].
++    attn_query: ?Tensor,
++    mlp_query: Tensor,
++    /// q, k and v input norms (a sliding layer's one norm three times).
++    norms: [3]Tensor,
++    post_norm: Tensor,
++    q: Linear,
++    k: Linear,
++    v: Linear,
++    r: Linear,
++    o: Linear,
++    gate: Linear,
++    sink: Tensor,
++    q_scale: Tensor,
++    rel_scale: Tensor,
++    rel_proj: Tensor,
++    k_conv: KvConv,
++    v_conv: KvConv,
++    attn_conv: Tensor,
++    mlp_conv: Tensor,
++    router: Tensor,
++    router_bias: Tensor,
++    ex_gate: Experts,
++    ex_up: Experts,
++    ex_down: Experts,
++    /// q, k, v and MLP message gates on loop layers.
++    gates: ?[4]Gate,
++};
++
++pub const Weights = struct {
++    embed: Linear,
++    embed_norm: Tensor,
++    layers: [g.layers]Layer,
++    final_query: Tensor,
++    norm: Tensor,
++    head: Linear,
++    /// The loop layers' four message queries each [loop layers, 4, hidden] FP32.
++    message_query: Tensor,
++};
++
++const prefix = "language_model.model.";
++
++fn expect(c: *const ck.Checkpoint, name: []const u8, dtype: ck.DType, shape: []const usize) !Tensor {
++    const t = c.get(name) catch |e| {
++        std.log.err("{s}: missing from the Inkling 2 checkpoint", .{name});
++        return e;
++    };
++    if (t.dtype != dtype or t.rank != shape.len or !std.mem.eql(usize, t.shape[0..t.rank], shape) or t.offset % 4 != 0) {
++        std.log.err("{s}: unexpected Inkling 2 tensor dtype, shape or alignment", .{name});
++        return error.UnexpectedInklingTensor;
++    }
++    return t;
++}
++
++fn named(c: *const ck.Checkpoint, p: []const u8, suffix: []const u8, dtype: ck.DType, shape: []const usize) !Tensor {
++    var buf: [256]u8 = undefined;
++    return expect(c, try std.fmt.bufPrint(&buf, "{s}{s}", .{ p, suffix }), dtype, shape);
++}
++
++fn affine(c: *const ck.Checkpoint, p: []const u8, suffix: []const u8, n: usize, k: usize) !Linear {
++    var buf: [256]u8 = undefined;
++    const t = try mlx_affine.read(c, try std.fmt.bufPrint(&buf, "{s}{s}", .{ p, suffix }), .{ .n = n, .k = k, .group = g.group });
++    return row.affine(t);
++}
++
++/// Experts' codes at the width their word count carries (3 or 4 bits), with FP32 or bf16 tables of one group a 64.
++fn experts(c: *const ck.Checkpoint, p: []const u8, suffix: []const u8, n: usize, k: usize) !Experts {
++    var buf: [256]u8 = undefined;
++    const w = try c.get(try std.fmt.bufPrint(&buf, "{s}{s}.weight", .{ p, suffix }));
++    if (w.rank != 3 or w.dtype != .u32) return error.UnexpectedInklingTensor;
++    const bits: u8 = @intCast(w.shape[2] * 32 / k);
++    if (bits != 3 and bits != 4 or w.shape[2] * 32 != k * bits) return error.UnexpectedInklingTensor;
++    _ = try named(c, p, try std.fmt.bufPrint(&buf, "{s}.weight", .{suffix}), .u32, &.{ g.experts, n, k * bits / 32 });
++    const scales = try c.get(try std.fmt.bufPrint(&buf, "{s}{s}.scales", .{ p, suffix }));
++    const dtype: ck.DType = if (scales.dtype == .bf16) .bf16 else .f32;
++    return .{
++        .w = w,
++        .s = try named(c, p, try std.fmt.bufPrint(&buf, "{s}.scales", .{suffix}), dtype, &.{ g.experts, n, k / g.group }),
++        .b = try named(c, p, try std.fmt.bufPrint(&buf, "{s}.biases", .{suffix}), dtype, &.{ g.experts, n, k / g.group }),
++        .bits = bits,
++        .n = n,
++        .k = k,
++        .bf16 = dtype == .bf16,
++    };
++}
++
++fn gates(c: *const ck.Checkpoint, p: []const u8) ![4]Gate {
++    var out: [4]Gate = undefined;
++    for (&out, [_][]const u8{ "q", "k", "v", "mlp" }) |*gt, name| {
++        var buf: [96]u8 = undefined;
++        gt.down = try named(c, p, try std.fmt.bufPrint(&buf, "{s}_message_gate.down_proj.weight", .{name}), .bf16, &.{ g.rank, 2 * g.hidden });
++        gt.forget = try named(c, p, try std.fmt.bufPrint(&buf, "{s}_message_gate.forget_gate_proj.weight", .{name}), .bf16, &.{ g.hidden, g.rank });
++        gt.gain = try named(c, p, try std.fmt.bufPrint(&buf, "{s}_message_gate.message_gate_proj.weight", .{name}), .bf16, &.{ g.hidden, g.rank });
++    }
++    return out;
++}
++
++fn kvConv(c: *const ck.Checkpoint, p: []const u8, which: []const u8, global: bool) !KvConv {
++    var buf: [96]u8 = undefined;
++    const kv = g.kv_heads * g.head_dim;
++    if (!global) return .{ .static = try named(c, p, try std.fmt.bufPrint(&buf, "self_attn.{s}_sconv.conv.weight", .{which}), .bf16, &.{ kv, 4, 1 }) };
++    return .{ .dynamic = .{
++        .taps = try named(c, p, try std.fmt.bufPrint(&buf, "self_attn.{s}_sconv.static_weight", .{which}), .bf16, &.{ 4, kv }),
++        .proj = try named(c, p, try std.fmt.bufPrint(&buf, "self_attn.{s}_sconv.weight_proj.weight", .{which}), .bf16, &.{ g.kv_heads * 4, g.hidden }),
++    } };
++}
++
++fn layer(c: *const ck.Checkpoint, i: usize) !Layer {
++    var buf: [96]u8 = undefined;
++    const p = try std.fmt.bufPrint(&buf, "{s}layers.{d}.", .{ prefix, i });
++    const global = (i + 1) % 6 == 0;
++    const looped = i >= 6 and i < 18;
++    const d = g.hidden;
++    const qd = g.q_heads * g.head_dim;
++    const kv = g.kv_heads * g.head_dim;
++    var norms: [3]Tensor = undefined;
++    if (global) {
++        for (&norms, [_][]const u8{ "q", "k", "v" }) |*n, name| {
++            var nb: [64]u8 = undefined;
++            n.* = try named(c, p, try std.fmt.bufPrint(&nb, "{s}_input_layernorm.weight", .{name}), .bf16, &.{d});
++        }
++    } else norms = @splat(try named(c, p, "input_layernorm.weight", .bf16, &.{d}));
++    return .{
++        .global = global,
++        .boundary = i % g.block == 0,
++        .attn_query = if (i == 0) null else if (global) try named(c, p, "attention_input.query", .f32, &.{ 3, d }) else try named(c, p, "attention_input.query", .f32, &.{d}),
++        .mlp_query = try named(c, p, "mlp_input.query", .f32, &.{d}),
++        .norms = norms,
++        .post_norm = try named(c, p, "post_attention_layernorm.weight", .bf16, &.{d}),
++        .q = try affine(c, p, "self_attn.q_proj", qd, d),
++        .k = try affine(c, p, "self_attn.k_proj", kv, d),
++        .v = try affine(c, p, "self_attn.v_proj", kv, d),
++        .r = try affine(c, p, "self_attn.r_proj", g.q_heads * g.d_rel, d),
++        .o = try affine(c, p, "self_attn.o_proj", d, qd),
++        .gate = try affine(c, p, "self_attn.gate_proj", qd, d),
++        .sink = try named(c, p, "self_attn.sink_proj.weight", .bf16, &.{ g.q_heads, d }),
++        .q_scale = try named(c, p, "self_attn.q_scale", .bf16, &.{ g.q_heads, g.head_dim }),
++        .rel_scale = try named(c, p, "self_attn.rel_scale", .bf16, &.{ g.q_heads, g.d_rel }),
++        .rel_proj = try named(c, p, "self_attn.rel_proj", .bf16, &.{ g.d_rel, g.extent }),
++        .k_conv = try kvConv(c, p, "k", global),
++        .v_conv = try kvConv(c, p, "v", global),
++        .attn_conv = try named(c, p, "attn_sconv.conv.weight", .bf16, &.{ d, 4, 1 }),
++        .mlp_conv = try named(c, p, "mlp_sconv.conv.weight", .bf16, &.{ d, 4, 1 }),
++        .router = try named(c, p, "mlp.gate_weight", .bf16, &.{ g.experts, d }),
++        .router_bias = try named(c, p, "mlp.e_score_correction_bias", .f32, &.{g.experts}),
++        .ex_gate = try experts(c, p, "mlp.switch_mlp.gate_proj", g.inter, d),
++        .ex_up = try experts(c, p, "mlp.switch_mlp.up_proj", g.inter, d),
++        .ex_down = try experts(c, p, "mlp.switch_mlp.down_proj", d, g.inter),
++        .gates = if (looped) try gates(c, p) else null,
++    };
++}
++
++pub fn load(c: *const ck.Checkpoint) !Weights {
++    var w: Weights = .{
++        .embed = try affine(c, prefix, "embed_tokens", g.vocab, g.hidden),
++        .embed_norm = try named(c, prefix, "embed_norm.weight", .bf16, &.{g.hidden}),
++        .layers = undefined,
++        .final_query = try named(c, prefix, "final_input.query", .f32, &.{g.hidden}),
++        .norm = try named(c, prefix, "norm.weight", .bf16, &.{g.hidden}),
++        .head = try affine(c, "language_model.", "lm_head", g.vocab, g.hidden),
++        .message_query = try named(c, prefix, "message_input.query", .f32, &.{ 12, 4, g.hidden }),
++    };
++    if (w.embed.bits != 4) return error.UnexpectedInklingTensor;
++    if (w.head.bits != 4 and w.head.bits != 6 and w.head.bits != 8) return error.UnexpectedInklingTensor;
++    for (&w.layers, 0..) |*l, i| {
++        l.* = try layer(c, i);
++        const same = l.ex_gate.bits == l.ex_up.bits and l.ex_gate.bf16 == l.ex_up.bf16 and l.ex_gate.bf16 == l.ex_down.bf16;
++        if (!same) return error.UnexpectedInklingTensor;
++    }
++    return w;
++}
+diff --git a/zig/src/tensorfold.zig b/zig/src/tensorfold.zig
+index 848b04b..00d328b 100644
+--- a/zig/src/tensorfold.zig
++++ b/zig/src/tensorfold.zig
+@@ -82,6 +82,7 @@ pub const qwen3_metal = @import("families/qwen3/metal/metal.zig");
+ pub const llama = @import("families/llama/llama.zig");
+ pub const flint = @import("families/flint/flint.zig");
+ pub const lfm2_moe = @import("families/lfm2_moe/lfm2_moe.zig");
++pub const inkling2_metal = @import("families/inkling2/metal/metal.zig");
+ pub const flashnext_pack = @import("families/flashnext/pack.zig");
+ pub const lfm3 = @import("families/lfm3/lfm3.zig");
+ 
+@@ -124,6 +125,7 @@ test {
+     _ = @import("families/lfm2_moe/backend.zig");
+     _ = @import("families/lfm2_moe/state.zig");
+     _ = @import("families/lfm2_moe/dspark_test.zig");
++    _ = @import("families/inkling2/metal/metal.zig");
+     _ = @import("families/deepseek_v41/metal/glue.zig"); // the launch wrappers' shape refusals, reached by no other test root
+     _ = @import("families/deepseek_v41/metal/vision.zig"); // its config refusals; no other test root reaches it
+ }
+diff --git a/zig/tests/inkling2/run.zig b/zig/tests/inkling2/run.zig
+new file mode 100644
+index 0000000..85afe2a
+--- /dev/null
++++ b/zig/tests/inkling2/run.zig
+@@ -0,0 +1,180 @@
++//! tf-inkling2-run MODEL_DIR REF_DIR [decode_tokens] [prompt_rows]: Mini on Metal against a reference dir, then timing.
++const std = @import("std");
++const mtl = @import("metal");
++const tf = @import("tensorfold");
++const ink = tf.inkling2_metal;
++const g = ink.geometry;
++
++fn readJsonIds(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) ![]u32 {
++    var buf: [1024]u8 = undefined;
++    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }), gpa, .limited(1 << 20));
++    defer gpa.free(bytes);
++    const parsed = try std.json.parseFromSlice([]u32, gpa, bytes, .{});
++    defer parsed.deinit();
++    return gpa.dupe(u32, parsed.value);
++}
++
++fn readNpy(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) ![]f32 {
++    var buf: [1024]u8 = undefined;
++    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }), gpa, .limited(1 << 30));
++    defer gpa.free(bytes);
++    const a = try tf.npy.parse(bytes);
++    if (!std.mem.eql(u8, a.descr, "<f4")) return error.ExpectedF32Npy;
++    const out = try gpa.alloc(f32, a.count());
++    @memcpy(std.mem.sliceAsBytes(out), a.data[0 .. out.len * 4]);
++    return out;
++}
++
++fn bf16(v: u16) f32 {
++    return @bitCast(@as(u32, v) << 16);
++}
++
++/// The worst row's cosine between native bf16 rows and the reference's FP32 rows, and the mean.
++fn cosine(native: []const u16, ref: []const f32, rows: usize) [2]f64 {
++    var worst: f64 = 1;
++    var sum: f64 = 0;
++    for (0..rows) |r| {
++        var dot: f64 = 0;
++        var na: f64 = 0;
++        var nb: f64 = 0;
++        for (0..g.hidden) |i| {
++            const a: f64 = bf16(native[r * g.hidden + i]);
++            const b: f64 = ref[r * g.hidden + i];
++            dot += a * b;
++            na += a * a;
++            nb += b * b;
++        }
++        const c = dot / (@sqrt(na * nb) + 1e-30);
++        worst = @min(worst, c);
++        sum += c;
++    }
++    return .{ worst, sum / @as(f64, @floatFromInt(rows)) };
++}
++
++fn now() f64 {
++    var t: std.c.timespec = undefined;
++    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t);
++    return @as(f64, @floatFromInt(t.sec)) + @as(f64, @floatFromInt(t.nsec)) / 1e9;
++}
++
++pub fn main(init: std.process.Init) !void {
++    const gpa = init.gpa;
++    const io = init.io;
++    const args = try init.minimal.args.toSlice(init.arena.allocator());
++    if (args.len < 3) return error.ExpectedModelAndReferenceDirs;
++    const decode_n: usize = if (args.len > 3) try std.fmt.parseInt(usize, args[3], 10) else 16;
++    const chunk: usize = if (args.len > 4) try std.fmt.parseInt(usize, args[4], 10) else 0;
++    const pool = mtl.objc.Pool.push();
++    defer pool.pop();
++    const ids = try readJsonIds(gpa, io, args[2], "tokens.json");
++    defer gpa.free(ids);
++    const want = readJsonIds(gpa, io, args[2], "greedy.json") catch try gpa.alloc(u32, 0);
++    defer gpa.free(want);
++    const t_load = now();
++    const m = try ink.Model.load(gpa, io, args[1]);
++    defer m.deinit();
++    std.debug.print("loaded in {d:.1} s\n", .{now() - t_load});
++    const rows = ids.len;
++    if (std.c.getenv("TF_INK_DUMP")) |dir| return dump(gpa, io, m, ids, std.mem.span(dir));
++    var cache = try ink.state.Cache.init(gpa, m.device, rows + decode_n + 8);
++    defer cache.deinit();
++    var scratch = try ink.state.Scratch.init(gpa, m.device, @max(rows, 1), rows);
++    defer scratch.deinit();
++    const cap = try cache.memory.alloc((g.visits + 1) * rows * g.hidden * 2);
++    try ink.forward.run(m, &scratch, &cache, ids, .{ .head = .all, .capture = cap });
++    const native = cap.slice(u16, (g.visits + 1) * rows * g.hidden);
++    var worst: f64 = 1;
++    for (0..g.visits + 1) |v| {
++        var nb: [64]u8 = undefined;
++        const name = if (v < g.visits) try std.fmt.bufPrint(&nb, "hidden_step{d}.npy", .{v}) else "final_norm.npy";
++        const ref = readNpy(gpa, io, args[2], name) catch |e| {
++            std.debug.print("{s}: {s}\n", .{ name, @errorName(e) });
++            continue;
++        };
++        defer gpa.free(ref);
++        const c = cosine(native[v * rows * g.hidden ..][0 .. rows * g.hidden], ref, rows);
++        worst = @min(worst, c[0]);
++        const plan = if (v < g.visits) m.plan[v] else ink.loop.Visit{ .layer = 99, .pass = 0, .slot = 0 };
++        std.debug.print("{s:>18} layer {d:>2} pass {d}: worst row cos {d:.6}, mean {d:.6}\n", .{ name, plan.layer, plan.pass, c[0], c[1] });
++    }
++    std.debug.print("worst hidden cosine over every visit and row: {d:.6}\n", .{worst});
++    if (readNpy(gpa, io, args[2], "last_logits.npy")) |ref| {
++        defer gpa.free(ref);
++        const last = scratch.logits.slice(f32, rows * g.vocab)[(rows - 1) * g.vocab ..][0..ref.len];
++        var dot: f64 = 0;
++        var na: f64 = 0;
++        var nb2: f64 = 0;
++        var diff: f64 = 0;
++        var ref_best: usize = 0;
++        for (ref, last, 0..) |b, a, i| {
++            dot += @as(f64, a) * b;
++            na += @as(f64, a) * a;
++            nb2 += @as(f64, b) * b;
++            diff = @max(diff, @abs(@as(f64, a) - b));
++            if (b > ref[ref_best]) ref_best = i;
++        }
++        std.debug.print("last logits: cos {d:.6}, max abs diff {d:.4}, ref top {d}, native top {d}\n", .{ dot / @sqrt(na * nb2), diff, ref_best, scratch.best.slice(u32, rows)[rows - 1] });
++    } else |_| {}
++    // Greedy decode from the prompt's last pick, then timing.
++    var out: std.ArrayList(u32) = .empty;
++    defer out.deinit(gpa);
++    var next = scratch.best.slice(u32, rows)[rows - 1];
++    try out.append(gpa, next);
++    var one = try ink.state.Scratch.init(gpa, m.device, 1, 1);
++    defer one.deinit();
++    const t0 = now();
++    for (1..decode_n) |_| {
++        try ink.forward.run(m, &one, &cache, &.{next}, .{ .head = .all });
++        next = one.best.slice(u32, 1)[0];
++        try out.append(gpa, next);
++    }
++    const dt = now() - t0;
++    std.debug.print("greedy: {any}\n", .{out.items});
++    if (want.len > 0) {
++        var same: usize = 0;
++        while (same < @min(want.len, out.items.len) and want[same] == out.items[same]) same += 1;
++        std.debug.print("greedy matches the reference for {d} of {d} tokens\n", .{ same, want.len });
++    }
++    if (decode_n > 1) std.debug.print("decode: {d} tokens in {d:.3} s = {d:.2} tok/s\n", .{ decode_n - 1, dt, @as(f64, @floatFromInt(decode_n - 1)) / dt });
++    if (chunk > 0) try prefill(gpa, m, chunk);
++}
++
++/// Prompt timing: one cold chunk of `n` synthetic ids, best of three, with no head past the last row.
++fn prefill(gpa: std.mem.Allocator, m: *ink.Model, n: usize) !void {
++    var cache = try ink.state.Cache.init(gpa, m.device, n);
++    defer cache.deinit();
++    var scratch = try ink.state.Scratch.init(gpa, m.device, n, 1);
++    defer scratch.deinit();
++    const ids = try gpa.alloc(u32, n);
++    defer gpa.free(ids);
++    for (ids, 0..) |*id, i| id.* = @intCast((i * 7919 + 13) % 200000);
++    var best: f64 = 1e30;
++    for (0..3) |_| {
++        cache.reset();
++        const t0 = now();
++        try ink.forward.run(m, &scratch, &cache, ids, .{ .head = .last });
++        best = @min(best, now() - t0);
++    }
++    std.debug.print("prefill: {d} tokens in {d:.3} s = {d:.1} tok/s\n", .{ n, best, @as(f64, @floatFromInt(n)) / best });
++}
++
++/// Debugging: the first TF_INK_VISITS visits (default 1), then every scratch buffer's rows written raw into `dir`.
++fn dump(gpa: std.mem.Allocator, io: std.Io, m: *ink.Model, ids: []const u32, dir: []const u8) !void {
++    const visits: usize = if (std.c.getenv("TF_INK_VISITS")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 1;
++    var cache = try ink.state.Cache.init(gpa, m.device, ids.len + 8);
++    defer cache.deinit();
++    var s = try ink.state.Scratch.init(gpa, m.device, ids.len, ids.len);
++    defer s.deinit();
++    try ink.forward.run(m, &s, &cache, ids, .{ .head = .none, .visits = visits });
++    const names = [_][]const u8{ "x", "xq", "xk", "xv", "q", "k", "v", "r", "gate", "sink", "dk", "dv", "kc", "vc", "qp", "rp", "attn", "o", "res", "mix", "msg", "xm", "route", "picks", "weights", "act", "ey", "moe", "blocks", "states", "gate_out" };
++    inline for (names) |n| {
++        const b = @field(s, n);
++        var nb: [512]u8 = undefined;
++        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&nb, "{s}/{s}.bin", .{ dir, n }), .data = b.contents()[0..b.length()] });
++    }
++    var nb: [512]u8 = undefined;
++    const kv = ink.state.row_kv_bytes * ids.len;
++    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&nb, "{s}/keys0.bin", .{dir}), .data = cache.kv.contents()[cache.keysOffset(0)..][0..kv] });
++    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&nb, "{s}/values0.bin", .{dir}), .data = cache.kv.contents()[cache.valuesOffset(0)..][0..kv] });
++    std.debug.print("dumped {d} visit(s) into {s}\n", .{ visits, dir });
++}

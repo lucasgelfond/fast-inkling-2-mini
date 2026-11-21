@@ -1,0 +1,59 @@
+[
+  {
+    "prompt_tokens": 48,
+    "generation_tokens": 192,
+    "prompt_tps": 65.32,
+    "generation_tps": 26.9,
+    "peak_memory_gb": 14.49,
+    "wall_s": 7.88,
+    "mode": "baseline"
+  },
+  {
+    "prompt_tokens": 48,
+    "generation_tokens": 192,
+    "prompt_tps": 68.92,
+    "generation_tps": 23.17,
+    "peak_memory_gb": 14.49,
+    "wall_s": 9.01,
+    "mode": "dspark",
+    "mean_accept": 0.71
+  },
+  {
+    "prompt_tokens": 31,
+    "generation_tokens": 192,
+    "prompt_tps": 60.16,
+    "generation_tps": 27.15,
+    "peak_memory_gb": 14.49,
+    "wall_s": 7.59,
+    "mode": "baseline"
+  },
+  {
+    "prompt_tokens": 31,
+    "generation_tokens": 192,
+    "prompt_tps": 65.72,
+    "generation_tps": 23.78,
+    "peak_memory_gb": 14.49,
+    "wall_s": 8.57,
+    "mode": "dspark",
+    "mean_accept": 0.58
+  },
+  {
+    "prompt_tokens": 66,
+    "generation_tokens": 192,
+    "prompt_tps": 107.14,
+    "generation_tps": 26.91,
+    "peak_memory_gb": 14.49,
+    "wall_s": 7.76,
+    "mode": "baseline"
+  },
+  {
+    "prompt_tokens": 66,
+    "generation_tokens": 192,
+    "prompt_tps": 110.08,
+    "generation_tps": 27.03,
+    "peak_memory_gb": 14.49,
+    "wall_s": 7.73,
+    "mode": "dspark",
+    "mean_accept": 0.8
+  }
+]

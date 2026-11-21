@@ -1,0 +1,40 @@
+[
+  {
+    "prompt_tokens": 48,
+    "generation_tokens": 160,
+    "prompt_tps": 60.45,
+    "generation_tps": 21.76,
+    "peak_memory_gb": 14.96,
+    "wall_s": 8.15,
+    "mode": "baseline"
+  },
+  {
+    "prompt_tokens": 48,
+    "generation_tokens": 160,
+    "prompt_tps": 64.04,
+    "generation_tps": 18.98,
+    "peak_memory_gb": 15.27,
+    "wall_s": 9.2,
+    "mode": "dspark",
+    "mean_accept": 0.73
+  },
+  {
+    "prompt_tokens": 31,
+    "generation_tokens": 160,
+    "prompt_tps": 54.66,
+    "generation_tps": 21.67,
+    "peak_memory_gb": 15.27,
+    "wall_s": 7.96,
+    "mode": "baseline"
+  },
+  {
+    "prompt_tokens": 31,
+    "generation_tokens": 160,
+    "prompt_tps": 59.62,
+    "generation_tps": 19.51,
+    "peak_memory_gb": 15.27,
+    "wall_s": 8.74,
+    "mode": "dspark",
+    "mean_accept": 0.57
+  }
+]

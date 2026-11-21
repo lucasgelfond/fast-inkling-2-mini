@@ -1,0 +1,14 @@
+#!/bin/zsh
+# Run a command while holding the heavyweight-model lock (one 14 GB model at a time).
+# Usage: scripts/with-gpu-lock <label> <command...>
+set -u
+root=${0:A:h:h}
+lock=$root/runtime/state/gpu.lock
+label=$1; shift
+until mkdir "$lock" 2>/dev/null; do
+  echo "[gpu-lock] waiting; held by: $(cat $lock/owner 2>/dev/null)" >&2
+  sleep 10
+done
+echo "$label pid $$ since $(date +%T)" > "$lock/owner"
+trap 'rm -rf "$lock"' EXIT INT TERM
+"$@"
