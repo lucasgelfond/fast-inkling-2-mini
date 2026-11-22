@@ -60,3 +60,5 @@ I added into Pi with this configuration:
   ]
 }
 ```
+
+For a shorter system prompt and tool list with local models, see [docs/pi-lean.md](docs/pi-lean.md).
