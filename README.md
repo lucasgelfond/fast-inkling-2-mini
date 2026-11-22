@@ -12,6 +12,8 @@ Fast local inference for [Inkling 2 Mini](https://thinkingmachines.ai/news/inkli
 | TensorFold ([#4337](https://github.com/ashhart/TensorFold/pull/4337)) | original (NVFP4 experts) | 11.6\* | ~41\* |
 
 
+On a 16 GB Mac (base M5), see [16gb-m5/](16gb-m5/): an 8.9 GB build with vision, tool calls, prefix caching, a 4-bit KV cache for long context, and pi auto-start.
+
 The loop model comes from [internet-projects/inkling2-mlx](https://github.com/internet-projects/inkling2-mlx), a dependency that is not vendored here.
 
 ## Install

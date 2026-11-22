@@ -1,0 +1,26 @@
+[project]
+name = "inkling-16gb"
+version = "0.1.0"
+description = "Inkling 2 Mini on a 16 GB Apple silicon Mac: LookAtMyQuant 8.9 GB + DSpark drafter, chunked prefill, OpenAI-compatible server"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "mlx>=0.32.4",
+    "huggingface_hub",
+    # LookAtMyQuant MLX runtime (trellis kernels, Inkling loop model, DSpark drafter), pinned
+    "lookatmyquant @ git+https://github.com/ShinMegamiBoson/lookatmyquant.git@80bbf85f719b5de18847c3e7d34703ef6c65069c",
+]
+
+[project.scripts]
+inkling-16gb = "inkling_16gb.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 130
