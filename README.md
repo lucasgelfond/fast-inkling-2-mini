@@ -37,8 +37,8 @@ I added into Pi with this configuration:
       "name": "Inkling 2 Mini",
       "reasoning": true,
       "input": ["text"],
-      "contextWindow": 32768,
-      "maxTokens": 16384,
+      "contextWindow": 262144,
+      "maxTokens": 65536,
       "compat": {
         "supportsDeveloperRole": false,
         "supportsReasoningEffort": true,
