@@ -100,7 +100,7 @@ def cmd_chat(a):
 def cmd_serve(a):
     from . import serve
 
-    serve.main(weights_path(a.model), a.port, a.alias)
+    serve.main(weights_path(a.model), a.port, a.alias, a.streams, a.sessions, a.cache_gb)
 
 
 def cmd_bench(a):
@@ -156,6 +156,9 @@ def main(argv=None):
     s = sub.add_parser("serve")
     s.add_argument("--port", type=int, default=8080)
     s.add_argument("--alias", default="Inkling-2-Mini", help="model id clients send")
+    s.add_argument("--streams", type=int, default=4, help="requests decoded together in one batch")
+    s.add_argument("--sessions", type=int, default=4, help="conversations kept in the prefix cache")
+    s.add_argument("--cache-gb", type=float, default=6.0, help="memory for prefix-cache snapshots")
     s.set_defaults(fn=cmd_serve)
     b = sub.add_parser("bench")
     b.add_argument("--baseline", action="store_true", help="measure standard mlx-vlm instead")

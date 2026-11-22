@@ -24,6 +24,22 @@ inkling-fast download
 inkling-fast serve --port 8080
 ```
 
+### Several agents at once
+
+`serve` decodes up to 4 requests together in one batch (`--streams`), and the prefix cache keeps a session for each of
+up to 4 conversations (`--sessions`, `--cache-gb 6`): pi plus three subagents each continue their own cache, and a
+shared system prompt is reused across them. Measured on the 32 GB M4, 400-token answers:
+
+| Concurrent requests | Total decode (tok/s) | Per request |
+|---|---|---|
+| 1 | 25.4–25.7 | 25.4–25.7 |
+| 2 | 31.4–31.6 | 15.7–15.8 |
+| 4 | 37.5–38.5 | 9.4–9.6 |
+
+Each turn snapshots the cache at most twice; a snapshot is dropped once two longer snapshots of the same
+conversation exist (`src/inkling_fast/sessions.py`). A session costs ~240 MB plus 32 KB per token (a 20k-token
+pi session: ~0.85 GB). MoE expert reads grow with the number of rows, so batching adds throughput, not per-request speed.
+
 I added into Pi with this configuration:
 
 

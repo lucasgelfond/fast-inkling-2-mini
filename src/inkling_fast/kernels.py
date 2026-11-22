@@ -5,6 +5,7 @@ bandwidth, sets the speed. These kernels collapse multi-op chains into one or
 two launches each.
 """
 
+import math
 from functools import cache
 
 import mlx.core as mx
@@ -252,12 +253,14 @@ def _mix_kernel(n, nq, fuse_norm, normalize_values, eps):
 
 
 def attention_mix(states, query, normalize_values=True, norm_weights=None, eps=1e-6, out_dtype=mx.float32):
-    """states: list of [1, L, D] arrays (blocks then partial); query: [D] or [NQ, D].
-    Returns [1, L, NQ, D] (out_dtype); RMSNorm'd with norm_weights [NQ, D] if given."""
+    """states: list of [B, T, D] arrays (blocks then partial); query: [D] or [NQ, D].
+    Returns [B, T, NQ, D] (out_dtype); RMSNorm'd with norm_weights [NQ, D] if given.
+    Rows are independent, so the kernel sees B * T rows."""
     n = len(states)
     q = query.reshape(-1, query.shape[-1]).astype(mx.float32)
     nq, d = q.shape
-    L = states[-1].shape[-2]
+    lead = states[-1].shape[:-1]
+    L = math.prod(lead)
     fuse = norm_weights is not None
     kernel = _mix_kernel(n, nq, fuse, bool(normalize_values), float(eps))
     inputs = [s.reshape(L, d) for s in states] + [q] + ([norm_weights] if fuse else [])
@@ -269,7 +272,7 @@ def attention_mix(states, query, normalize_values=True, norm_weights=None, eps=1
         output_shapes=[(L, nq, d)],
         output_dtypes=[out_dtype],
     )
-    return out.reshape(1, L, nq, d)
+    return out.reshape(*lead, nq, d)
 
 
 # ---------------------------------------------------------------------------

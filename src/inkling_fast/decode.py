@@ -12,8 +12,10 @@ custom Metal kernels (kernels.py):
   [eager] conv/KV cache commit (speculation-aware), relative mask, SDPA
   post(attn, gate, x, blocks, conv_a, conv_m, msg) -> out, conv ctx
 
-Handles batch 1 with 1..MAX_TOKENS tokens, including speculative verify with
-hidden-state captures (DSpark taps), so drafters run on this path too.
+Handles 1..MAX_TOKENS tokens per row, including speculative verify with
+hidden-state captures (DSpark taps), so drafters run on this path too. Batches
+of several rows (concurrent requests in the server's continuous batch) take the
+same path: rows are left-padded, so each row has its own position and mask.
 """
 
 import math
@@ -126,10 +128,11 @@ class _Pass:
             mixed = attention_mix([*blocks, x], layer.attention_input.query, nv)
             parts = [mixed[..., 0, :]] * 3 if layer.is_sliding else [mixed[..., i, :] for i in range(3)]
         if msgs is not None:
-            # [n, 3, d] -> [3 * n, d]: gate g of token t at row g * n + t.
-            h = mx.stack([p.reshape(n, d) for p in parts]).astype(mx.float32).reshape(3 * n, d)
-            m = msgs.reshape(n, 4, d)[:, :3].transpose(1, 0, 2).reshape(3 * n, d).astype(mx.float32)
-            gated = message_gates(h, m, *self.qkv_gates, self.eps, tokens=n).reshape(3, b, n, d)
+            # [rows, 3, d] -> [3 * rows, d]: gate g of row t at g * rows + t.
+            rows = b * n
+            h = mx.stack([p.reshape(rows, d) for p in parts]).astype(mx.float32).reshape(3 * rows, d)
+            m = msgs.reshape(rows, 4, d)[:, :3].transpose(1, 0, 2).reshape(3 * rows, d).astype(mx.float32)
+            gated = message_gates(h, m, *self.qkv_gates, self.eps, tokens=rows).reshape(3, b, n, d)
             parts = [norm(gated[i]).astype(dtype) for i, norm in enumerate(norms)]
         q_in, k_in, v_in = parts
         o = packed.splits
@@ -172,9 +175,9 @@ class _Pass:
         if cfg.use_value_norm_no_gamma:
             v = mx.fast.rms_norm(v.astype(mx.float32), None, cfg.rms_norm_eps).astype(dtype)
         r = L.l2_clip(r.reshape(b, n, attn.n_heads, cfg.d_rel), cfg.rel_l2_clip_threshold, attn.rel_scale)
-        if tau is not None:
-            q = (q.astype(mx.float32) * tau[:, None, None]).astype(dtype)
-            r = (r.astype(mx.float32) * tau[:, None, None]).astype(dtype)
+        if tau is not None:  # [n] or, per row, [b, n]
+            q = (q.astype(mx.float32) * tau[..., None, None]).astype(dtype)
+            r = (r.astype(mx.float32) * tau[..., None, None]).astype(dtype)
         sinks = attn.sink_proj(q_in)  # [b, n, H]
         msg_mlp = msgs[..., 3, :] if msgs is not None else None
         q, k, v = (a.transpose(0, 2, 1, 3) for a in (q, k, v))
@@ -203,8 +206,8 @@ class _Pass:
         else:
             hidden = attention_mix([*blocks, residual], layer.mlp_input.query, nv)[..., 0, :]
             hidden = message_gates(
-                hidden.reshape(n, d), msg_mlp.reshape(n, d).astype(mx.float32),
-                *self.mlp_gates, self.eps, tokens=n,
+                hidden.reshape(b * n, d), msg_mlp.reshape(b * n, d).astype(mx.float32),
+                *self.mlp_gates, self.eps, tokens=b * n,
             ).reshape(hidden.shape)
             normed = layer.post_attention_layernorm(hidden).astype(dtype)
         hidden = layer.mlp(normed)
@@ -227,9 +230,13 @@ class _Pass:
         tau = None
         if not attn.is_sliding and self.cfg.log_scaling_n_floor is not None:
             a, fl = self.cfg.log_scaling_alpha, self.cfg.log_scaling_n_floor
-            tau = mx.array(
-                [1 + a * math.log(max((kv.offset + 1 + t) / fl, 1)) for t in range(n)], mx.float32
-            )
+            if isinstance(kv.offset, int):
+                tau = mx.array(
+                    [1 + a * math.log(max((kv.offset + 1 + t) / fl, 1)) for t in range(n)], mx.float32
+                )
+            else:  # batch caches keep one offset per row
+                positions = kv.offset[:, None] + 1 + mx.arange(n)
+                tau = 1 + a * mx.log(mx.maximum(positions.astype(mx.float32) / fl, 1))
         prev_blocks, prev_x = prev if prev is not None else (None, None)
         q, k, v, r, g, sinks, ctx_k, ctx_v, msg_mlp = self.pre(x, blocks, prev_blocks, prev_x, conv_k, conv_v, tau)
         k, v = kv.update_and_fetch(k, v)
@@ -250,7 +257,7 @@ class _Pass:
                 left_padding=getattr(kv, "left_padding", None), shape_ref=k,
             )
         scale = attn.head_dim**-0.5
-        if n == 1:
+        if n == 1 and b == 1:
             attn_out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask, sinks=sinks.reshape(-1))
         else:
             # Query-dependent sinks: a zero K/V slot with its own logit.
@@ -293,17 +300,15 @@ class FastDecoder:
         if cache is None or kwargs.get("return_hidden") or kwargs.get("return_shared_kv"):
             return False
         ref = inputs if inputs_embeds is None else inputs_embeds
-        if ref is None or ref.shape[0] != 1 or not (1 <= ref.shape[1] <= MAX_TOKENS or ref.shape[1] in PREFILL_SIZES):
+        if ref is None or not (1 <= ref.shape[1] <= MAX_TOKENS or ref.shape[1] in PREFILL_SIZES):
             return False
         ids = kwargs.get("capture_layer_ids")
         if ids is not None and any(type(i) is not int or not 0 <= i <= self.total for i in ids):
             return False
+        # Padded prompt chunks mask the conv states; the reference path handles those.
+        # KV left padding (rows of a continuous batch) is masked here.
         kv, conv = cache[0]
-        return (
-            getattr(conv, "left_padding", None) is None
-            and getattr(conv, "lengths", None) is None
-            and getattr(kv, "left_padding", None) is None
-        )
+        return getattr(conv, "left_padding", None) is None and getattr(conv, "lengths", None) is None
 
     def forward(self, inputs, inputs_embeds, cache, capture_layer_ids=None):
         model = self.lm.model
@@ -370,10 +375,12 @@ def keep_single_row_restores_plain():
     """Keep a lone APC restore in single-request caches.
 
     APC merges restored rows into batch caches, even when there is only one
-    row. A one-row batch cache has left_padding [0], which eligible() rejects,
-    so every turn after a prefix-cache hit decoded on the slow path (about 18
-    vs 26 tok/s). The rows are owned copies, and _merge_and_release_cache_rows
-    already uses a lone row as-is when no merge applies.
+    row. A one-row batch cache has left_padding [0], which eligible() used to
+    reject, so every turn after a prefix-cache hit decoded on the slow path
+    (about 18 vs 26 tok/s). Batch caches take the fast path now; a plain cache
+    still skips rolling the sliding window every step. The rows are owned
+    copies, and _merge_and_release_cache_rows already uses a lone row as-is
+    when no merge applies.
     """
     from mlx_vlm import apc
 

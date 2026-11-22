@@ -3,6 +3,9 @@
 Wraps mlx-vlm's server: the model is loaded as usual, then the compiled decode
 path is installed. Exact automatic prefix caching (APC) is on by default, so
 repeated prompt prefixes (system prompts, chat history) skip prefill.
+
+Up to `streams` requests decode together in one batch (several agents at once),
+and APC keeps snapshots for up to `sessions` conversations (see sessions.py).
 """
 
 from __future__ import annotations
@@ -11,16 +14,26 @@ import os
 import sys
 
 
-def main(weights: str, port: int, alias: str = "Inkling-2-Mini") -> None:
+def main(
+    weights: str,
+    port: int,
+    alias: str = "Inkling-2-Mini",
+    streams: int = 4,
+    sessions: int = 4,
+    cache_gb: float = 6.0,
+) -> None:
     os.environ.setdefault("APC_ENABLED", "1")
-    os.environ.setdefault("APC_DISK_MAX_GB", "4")
+    os.environ.setdefault("APC_DISK_MAX_GB", "16")
+    os.environ.setdefault("APC_CHECKPOINT_ENTRIES", str(2 * sessions))
+    os.environ.setdefault("APC_MEMORY_MAX_GB", str(cache_gb))
 
     import mlx_vlm.server as server_pkg
     import mlx_vlm.server.generation as generation
 
     import inkling_fast  # noqa: F401  registers inkling2_loop
-    from inkling_fast import decode
+    from inkling_fast import decode, sessions as session_cache
 
+    session_cache.install()
     original_load = generation.load
 
     def load_fast(*args, **kwargs):
@@ -47,6 +60,6 @@ def main(weights: str, port: int, alias: str = "Inkling-2-Mini") -> None:
     # 512-token chunks are the fastest GPU prefill size measured, and they take the compiled path.
     sys.argv = [
         "mlx_vlm.server", "--model", weights, "--host", "127.0.0.1", "--port", str(port),
-        "--max-num-seqs", "1", "--prefill-step-size", "512",
+        "--max-num-seqs", str(streams), "--prefill-step-size", "512",
     ]
     server_main()
