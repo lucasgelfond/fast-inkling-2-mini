@@ -127,6 +127,11 @@ For scale: the 8.9 GB weight quantization itself is KL 0.0208 vs BF16. 4-bit KV 
 3. Lean prompt: install [`lean.ts`](../docs/pi-lean.md) - local models get a ~1k-token prompt and four tools instead
    of ~10k tokens.
 
+Checked in a live pi session (4 user turns, bash + edit tool calls, low thinking): every request after the first
+continued the live cache, 92-99% of each prompt reused, only the new tool output / message read (10-100 tokens, 0.2-0.5 s).
+The server log prints this per request, e.g.
+`[req] prompt 2112 tok (live: 2098 reused, 14 new ...) | ... | encode 6 ms, plan 0 ms, target_prefill 412 ms`.
+
 `requiresThinkingAsText: false` matters: pi then echoes thinking back as `reasoning_content`, which re-renders
 token-identically, so each turn continues the live cache instead of re-reading the reply.
 

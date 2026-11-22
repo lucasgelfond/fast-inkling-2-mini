@@ -7,7 +7,7 @@ this was run against it. It's a map from what `16gb-m5/` changed to where the sa
 | 16gb-m5 change | Where it lives here | 3-bit engine | Action |
 |---|---|---|---|
 | Chunked prefill (512) | `engine.py` `_install_hooks` | already: mlx-vlm server `--prefill-step-size 512` | none |
-| Prefix cache, live continuation + checkpoint | `engine.py` `_Slot`, `_Checkpoint` | already: mlx-vlm APC (+ the `merge_exact` fix in `decode.py`) | check that pi turns hit APC: needs pi to echo `reasoning_content` (below) |
+| Prefix cache, live continuation + checkpoint | `engine.py` `_Slot`, `_Checkpoint` | already: mlx-vlm APC (+ the `merge_exact` fix in `decode.py`) | check that pi turns hit APC: needs pi to echo `reasoning_content` (below). On 16gb-m5 this was verified with a pi RPC session: every request after the first reused 92-99% of its prompt |
 | Several cached conversations | `engine.py` `_pick_slot` | APC is keyed by prefix, so several sessions should coexist | verify APC capacity (`APC_DISK_MAX_GB`, in-memory entries) with 2+ pi sessions |
 | Tool calls / images through the chat template | `engine.py` `encode`, `_OutputParser` | mlx-vlm server | none; vision already in the 3-bit weights (quantized) |
 | Quantized KV for the 8 global-attention visits (4/8-bit, group 32) | `qkv.py` (rewrites the LookAtMyQuant Metal kernels) | `decode.py` attention: mlx-vlm `KVCache` + `mx.fast.scaled_dot_product_attention` with an additive relpos mask | use mlx-lm `QuantizedKVCache` for the **global** layers only (sliding layers are already `RotatingKVCache`, capped) and `quantized_scaled_dot_product_attention` from `mlx_lm.models.base` (takes the additive mask; check `sinks` support). Leads, unverified: mlx-vlm's `--kv-bits` / `--quantized-kv-start` options |

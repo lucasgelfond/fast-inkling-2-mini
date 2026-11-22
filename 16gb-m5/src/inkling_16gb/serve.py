@@ -55,7 +55,9 @@ class Handler(BaseHTTPRequestHandler):
             temp = float(req.get("temperature") or 0.0)
             top_p = float(req.get("top_p") or 1.0)
             tools = req.get("tools") if req.get("tool_choice") != "none" else None
+            t_enc = time.time()
             prompt = self.engine.encode(req.get("messages", []), effort, tools)
+            t_enc = time.time() - t_enc
         except Exception as e:
             traceback.print_exc()
             return self._json(400, {"error": {"message": f"{type(e).__name__}: {e}"}})
@@ -121,7 +123,7 @@ class Handler(BaseHTTPRequestHandler):
               f"{info['prompt_tokens'] - info['cached_tokens']} new @ {info['prompt_tps']:.0f} tok/s) | "
               f"gen {info['completion_tokens']} tok @ {info['generation_tps']:.1f} tok/s{tpc}"
               f"{' | ' + str(len(calls)) + ' tool call(s)' if calls else ''} | effort={prompt['effort']} | "
-              f"{time.time() - t0:.1f}s", flush=True)
+              f"{time.time() - t0:.1f}s | encode {t_enc*1e3:.0f} ms, " + ", ".join(f"{k} {v*1e3:.0f} ms" for k, v in info.get("timing", {}).items()), flush=True)
         if stream:
             try:
                 send({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})

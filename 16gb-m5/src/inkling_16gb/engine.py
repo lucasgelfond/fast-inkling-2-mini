@@ -567,7 +567,9 @@ class Engine:
         # Past ~32k tokens a drafted verify block (each of ~8 rows re-reads the whole KV cache) costs more than it
         # saves: measured at 100k, serial 12.3 tok/s vs drafted 7.2. Below that, drafting is 1.5-1.6x on code/math.
         drafting = self.drafter is not None and len(ids) <= self.draft_max_context
+        t_plan = time.perf_counter()
         base, how = self._plan(prompt, drafting)
+        t_plan = time.perf_counter() - t_plan
         cache = self.cache
         cache._inkling16_reserve = len(ids) + max_tokens + 64  # size the quantized KV once, not by repeated growth
         # one token short of the stable end, so an identical re-send (retry, regenerate) can still restore and feed 1 token
@@ -621,6 +623,8 @@ class Engine:
             "completion_tokens": n_gen,
             "prompt_tps": (len(ids) - base) / prompt_s if prompt_s > 0 else 0.0,
             "prompt_s": prompt_s,
+            "timing": {"plan": t_plan, "target_prefill": float(stats.get("prompt_s", 0.0)),
+                       "drafter_rebuild": float(stats.get("drafter_prompt_s", 0.0))},
             "generation_tps": stats.get("tokens", n_gen) / rounds_s if rounds_s > 0 else 0.0,
             "tokens_per_check": stats.get("tokens_per_check"),
         }
